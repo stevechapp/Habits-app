@@ -26,6 +26,8 @@ export type PeriodInfo = {
 export type MomentumPoint = { date: string; score: number };
 export type CategoryScore = { category: string; score: number };
 export type CategoryScoreHistoryPoint = { date: string; scores: Record<string, number> };
+export type HistorySquare = { date: string; done: boolean };
+export type CompletionRate = { met: number; total: number; rate: number };
 
 type StoredData = {
   version: number;
@@ -51,14 +53,16 @@ type HabitsContextType = {
   getHabitMomentumSeries: (habit: Habit) => MomentumPoint[];
   getCategoryScores: () => CategoryScore[];
   getCategoryScoreHistory: () => CategoryScoreHistoryPoint[];
+  getLongestStreak: (habit: Habit) => number;
+  getHabitHistorySquares: (habit: Habit) => HistorySquare[];
+  getPeriodStreak: (habit: Habit) => number;
+  getCompletionRate: (habit: Habit) => CompletionRate;
 };
 
 const STORAGE_KEY = 'habits';
 const CURRENT_VERSION = 3;
 const DEFAULT_CATEGORY = 'Uncategorized';
 
-// Momentum scoring config — kept as named constants so it's easy to tune
-// or later expose as per-habit overrides (e.g. for combo/gamification features).
 const MOMENTUM_WINDOW_DAYS = 90;
 const MOMENTUM_BASELINE = 50;
 const MOMENTUM_GAIN = 10;
@@ -77,15 +81,31 @@ const CATEGORY_PALETTE = [
   '#FCE7F3', '#E7E5E4', '#FFEDD5', '#E0E7FF',
 ];
 
-export function getCategoryColor(category: string): string {
-  if (!category || category === DEFAULT_CATEGORY) return '#F2F2F2';
+// Same hue family as CATEGORY_PALETTE, but saturated enough to read as a
+// line/stroke on a white background (the pastel palette is too faint for that).
+const CATEGORY_ACCENT_PALETTE = [
+  '#a855f7', '#0ea5e9', '#22c55e', '#eab308',
+  '#ec4899', '#78716c', '#f97316', '#6366f1',
+];
+
+function categoryPaletteIndex(category: string): number {
+  if (!category) return 0;
   let hash = 0;
   for (let i = 0; i < category.length; i++) {
     hash = (hash << 5) - hash + category.charCodeAt(i);
     hash |= 0;
   }
-  const index = Math.abs(hash) % CATEGORY_PALETTE.length;
-  return CATEGORY_PALETTE[index];
+  return Math.abs(hash) % CATEGORY_PALETTE.length;
+}
+
+export function getCategoryColor(category: string): string {
+  if (!category || category === DEFAULT_CATEGORY) return '#F2F2F2';
+  return CATEGORY_PALETTE[categoryPaletteIndex(category)];
+}
+
+export function getCategoryAccentColor(category: string): string {
+  if (!category || category === DEFAULT_CATEGORY) return '#999999';
+  return CATEGORY_ACCENT_PALETTE[categoryPaletteIndex(category)];
 }
 
 function dateToString(d: Date): string {
@@ -190,9 +210,6 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
   return { status, completedCount, targetCount: habit.targetCount, squares };
 }
 
-// Walks day-by-day over the momentum window, evolving a 0-100 score per habit.
-// Gains on completed days; decays only once a period is genuinely unmakeable
-// ('behind'), so there's no penalty while a target is still achievable.
 function calculateMomentumSeries(habit: Habit, today: string, windowDays: number): MomentumPoint[] {
   const series: MomentumPoint[] = [];
   const startCursor = new Date(today);
@@ -212,7 +229,6 @@ function calculateMomentumSeries(habit: Habit, today: string, windowDays: number
       if (info.status === 'behind') {
         score = Math.max(MOMENTUM_MIN, score - MOMENTUM_DECAY);
       }
-      // onTrack / dueSoon / met -> no change, still achievable or already done
     }
 
     series.push({ date: dateStr, score });
@@ -220,6 +236,121 @@ function calculateMomentumSeries(habit: Habit, today: string, windowDays: number
   }
 
   return series;
+}
+
+function calculateLongestStreak(completions: Record<string, boolean>): number {
+  const doneDates = Object.keys(completions)
+    .filter(d => completions[d] === true)
+    .sort();
+
+  if (doneDates.length === 0) return 0;
+
+  let longest = 1;
+  let current = 1;
+
+  for (let i = 1; i < doneDates.length; i++) {
+    const prev = new Date(doneDates[i - 1]);
+    const curr = new Date(doneDates[i]);
+    const diffDays = Math.round((curr.getTime() - prev.getTime()) / 86400000);
+
+    if (diffDays === 1) {
+      current++;
+    } else if (diffDays > 1) {
+      current = 1;
+    }
+    // diffDays === 0 shouldn't happen (duplicate keys aren't possible in an object)
+
+    longest = Math.max(longest, current);
+  }
+
+  return longest;
+}
+
+// Builds one square per day from the earliest recorded completion through today.
+// If nothing's ever been completed, returns an empty array (nothing to show yet).
+function buildHistorySquares(habit: Habit, today: string): HistorySquare[] {
+  const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true);
+  if (doneDates.length === 0) return [];
+
+  const earliest = doneDates.sort()[0];
+  const squares: HistorySquare[] = [];
+  const cursor = new Date(earliest);
+  const end = new Date(today);
+
+  while (cursor <= end) {
+    const dateStr = dateToString(cursor);
+    squares.push({ date: dateStr, done: habit.completions[dateStr] === true });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return squares;
+}
+
+// Consecutive periods (days/weeks/months, depending on habit.targetPeriod) where
+// the target was met, counting backward from the current (possibly still-open)
+// period. Mirrors the day-streak logic, but at the habit's own period granularity.
+function calculatePeriodStreak(habit: Habit, today: string): number {
+  let streak = 0;
+  const currentInfo = calculatePeriodInfo(habit, today);
+  const currentBounds = getPeriodBounds(today, habit.targetPeriod);
+
+  if (currentInfo.status === 'met') {
+    streak++;
+  }
+
+  let cursor = new Date(currentBounds.start);
+  cursor.setDate(cursor.getDate() - 1); // step into the previous period
+
+  let safety = 0;
+  while (safety < 1000) {
+    safety++;
+    const dateStr = dateToString(cursor);
+    const info = calculatePeriodInfo(habit, dateStr);
+    if (info.status !== 'met') break;
+
+    streak++;
+    const bounds = getPeriodBounds(dateStr, habit.targetPeriod);
+    cursor = new Date(bounds.start);
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  return streak;
+}
+
+// % of fully-closed past periods where the target was met, from the earliest
+// recorded completion through the most recent period that's actually finished
+// (the current, still-in-progress period is excluded — it hasn't had its full
+// chance yet).
+function calculateCompletionRate(habit: Habit, today: string): CompletionRate {
+  const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true);
+  if (doneDates.length === 0) return { met: 0, total: 0, rate: 0 };
+
+  const earliest = doneDates.sort()[0];
+  const todayDate = new Date(today);
+
+  let cursor = new Date(earliest);
+  let met = 0;
+  let total = 0;
+  let safety = 0;
+
+  while (safety < 2000) {
+    safety++;
+    const dateStr = dateToString(cursor);
+    const bounds = getPeriodBounds(dateStr, habit.targetPeriod);
+
+    if (bounds.end >= todayDate) break; // period isn't fully closed yet — stop here
+
+    const endDateStr = dateToString(bounds.end);
+    const info = calculatePeriodInfo(habit, endDateStr);
+    total++;
+    if (info.status === 'met') met++;
+
+    cursor = new Date(bounds.end);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  const rate = total > 0 ? Math.round((met / total) * 100) : 0;
+  return { met, total, rate };
 }
 
 const HabitsContext = createContext<HabitsContextType | undefined>(undefined);
@@ -351,8 +482,22 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return calculateMomentumSeries(habit, today, MOMENTUM_WINDOW_DAYS);
   }
 
-  // Today's momentum snapshot per category, averaged across that category's habits.
-  // Feeds the spider/radar chart (one axis per category).
+  function getLongestStreak(habit: Habit): number {
+    return calculateLongestStreak(habit.completions);
+  }
+
+  function getHabitHistorySquares(habit: Habit): HistorySquare[] {
+    return buildHistorySquares(habit, today);
+  }
+
+  function getPeriodStreak(habit: Habit): number {
+    return calculatePeriodStreak(habit, today);
+  }
+
+  function getCompletionRate(habit: Habit): CompletionRate {
+    return calculateCompletionRate(habit, today);
+  }
+
   function getCategoryScores(): CategoryScore[] {
     const categories = Array.from(new Set(habits.map(h => h.category)));
     return categories.map(category => {
@@ -368,11 +513,9 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     });
   }
 
-  // Full 90-day trend, per category, for a line/area chart.
   function getCategoryScoreHistory(): CategoryScoreHistoryPoint[] {
     const categories = Array.from(new Set(habits.map(h => h.category)));
 
-    // Precompute each habit's full series once.
     const habitSeries = habits.map(h => ({
       category: h.category,
       series: calculateMomentumSeries(h, today, MOMENTUM_WINDOW_DAYS),
@@ -423,6 +566,10 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getHabitMomentumSeries,
         getCategoryScores,
         getCategoryScoreHistory,
+        getLongestStreak,
+        getHabitHistorySquares,
+        getPeriodStreak,
+        getCompletionRate,
       }}
     >
       {children}

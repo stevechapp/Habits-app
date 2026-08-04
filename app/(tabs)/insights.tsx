@@ -1,9 +1,9 @@
 import { StyleSheet, Text, SafeAreaView, View, ScrollView, useWindowDimensions } from 'react-native';
-import Svg, { Polygon, Line, Circle, Text as SvgText } from 'react-native-svg';
-import { useHabits, getCategoryColor, CategoryScore } from '../HabitsContext';
+import Svg, { Polygon, Polyline, Line, Circle, Text as SvgText } from 'react-native-svg';
+import { useHabits, getCategoryColor, getCategoryAccentColor, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate } from '../HabitsContext';
 
-const GRID_LEVELS = [0.25, 0.5, 0.75, 1.0]; // as fraction of max radius
-const CHART_ACCENT = '#7c3aed'; // solid line/fill colour for the data shape itself
+const GRID_LEVELS = [0.25, 0.5, 0.75, 1.0];
+const CHART_ACCENT = '#7c3aed';
 
 function polarPoint(cx: number, cy: number, radius: number, angleDeg: number) {
   const angleRad = ((angleDeg - 90) * Math.PI) / 180;
@@ -31,21 +31,17 @@ function RadarChart({ data, size }: { data: CategoryScore[]; size: number }) {
 
   const angleStep = 360 / numAxes;
 
-  // Grid rings (concentric polygons, spiderweb style)
-  const gridPolygons = GRID_LEVELS.map(level => {
-    const points = data
+  const gridPolygons = GRID_LEVELS.map(level =>
+    data
       .map((_, i) => {
         const p = polarPoint(center, center, maxRadius * level, i * angleStep);
         return `${p.x},${p.y}`;
       })
-      .join(' ');
-    return points;
-  });
+      .join(' ')
+  );
 
-  // Axis lines from center to edge
   const axisLines = data.map((_, i) => polarPoint(center, center, maxRadius, i * angleStep));
 
-  // The actual data shape
   const dataPoints = data
     .map((d, i) => {
       const r = maxRadius * (Math.max(0, Math.min(100, d.score)) / 100);
@@ -54,7 +50,6 @@ function RadarChart({ data, size }: { data: CategoryScore[]; size: number }) {
     })
     .join(' ');
 
-  // Label positions, nudged slightly further out than the outer grid ring
   const labels = data.map((d, i) => {
     const p = polarPoint(center, center, maxRadius + 20, i * angleStep);
     return { ...p, category: d.category };
@@ -63,25 +58,11 @@ function RadarChart({ data, size }: { data: CategoryScore[]; size: number }) {
   return (
     <Svg width={size} height={size}>
       {gridPolygons.map((points, i) => (
-        <Polygon
-          key={i}
-          points={points}
-          fill="none"
-          stroke="#e5e5e5"
-          strokeWidth={1}
-        />
+        <Polygon key={i} points={points} fill="none" stroke="#e5e5e5" strokeWidth={1} />
       ))}
 
       {axisLines.map((p, i) => (
-        <Line
-          key={i}
-          x1={center}
-          y1={center}
-          x2={p.x}
-          y2={p.y}
-          stroke="#e5e5e5"
-          strokeWidth={1}
-        />
+        <Line key={i} x1={center} y1={center} x2={p.x} y2={p.y} stroke="#e5e5e5" strokeWidth={1} />
       ))}
 
       <Polygon
@@ -99,15 +80,7 @@ function RadarChart({ data, size }: { data: CategoryScore[]; size: number }) {
       })}
 
       {labels.map((l, i) => (
-        <SvgText
-          key={i}
-          x={l.x}
-          y={l.y}
-          fontSize={12}
-          fontWeight="600"
-          fill="#555"
-          textAnchor="middle"
-        >
+        <SvgText key={i} x={l.x} y={l.y} fontSize={12} fontWeight="600" fill="#555" textAnchor="middle">
           {l.category}
         </SvgText>
       ))}
@@ -115,40 +88,248 @@ function RadarChart({ data, size }: { data: CategoryScore[]; size: number }) {
   );
 }
 
+function formatShortDate(dateStr: string): string {
+  const d = new Date(dateStr);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function TrendLineChart({
+  history,
+  categories,
+  width,
+  height,
+}: {
+  history: CategoryScoreHistoryPoint[];
+  categories: string[];
+  width: number;
+  height: number;
+}) {
+  const paddingLeft = 32;
+  const paddingRight = 12;
+  const paddingTop = 12;
+  const paddingBottom = 24;
+
+  const chartWidth = width - paddingLeft - paddingRight;
+  const chartHeight = height - paddingTop - paddingBottom;
+
+  if (history.length === 0) {
+    return null;
+  }
+
+  function xFor(index: number): number {
+    return paddingLeft + (index / (history.length - 1)) * chartWidth;
+  }
+
+  function yFor(score: number): number {
+    const clamped = Math.max(0, Math.min(100, score));
+    return paddingTop + (1 - clamped / 100) * chartHeight;
+  }
+
+  const gridLevels = [0, 25, 50, 75, 100];
+
+  return (
+    <Svg width={width} height={height}>
+      {gridLevels.map(level => (
+        <Line
+          key={level}
+          x1={paddingLeft}
+          y1={yFor(level)}
+          x2={width - paddingRight}
+          y2={yFor(level)}
+          stroke="#eee"
+          strokeWidth={1}
+        />
+      ))}
+      {gridLevels.map(level => (
+        <SvgText key={level} x={4} y={yFor(level) + 4} fontSize={10} fill="#999">
+          {level}
+        </SvgText>
+      ))}
+
+      {categories.map(category => {
+        const points = history
+          .map((point, i) => `${xFor(i)},${yFor(point.scores[category] ?? 50)}`)
+          .join(' ');
+        return (
+          <Polyline
+            key={category}
+            points={points}
+            fill="none"
+            stroke={getCategoryAccentColor(category)}
+            strokeWidth={3}
+          />
+        );
+      })}
+
+      <SvgText x={paddingLeft} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[0].date)}
+      </SvgText>
+      <SvgText x={width - paddingRight - 44} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[history.length - 1].date)}
+      </SvgText>
+    </Svg>
+  );
+}
+
+function buildWeekColumns(squares: HistorySquare[]): (HistorySquare | null)[][] {
+  if (squares.length === 0) return [];
+
+  const firstDate = new Date(squares[0].date);
+  const startDow = firstDate.getDay(); // 0 = Sunday
+
+  const padded: (HistorySquare | null)[] = [];
+  for (let i = 0; i < startDow; i++) padded.push(null);
+  padded.push(...squares);
+
+  const weeks: (HistorySquare | null)[][] = [];
+  for (let i = 0; i < padded.length; i += 7) {
+    weeks.push(padded.slice(i, i + 7));
+  }
+  return weeks;
+}
+
+function HabitHeatmap({ habit, squares }: { habit: Habit; squares: HistorySquare[] }) {
+  const weeks = buildWeekColumns(squares);
+  const accent = getCategoryAccentColor(habit.category);
+
+  if (weeks.length === 0) {
+    return <Text style={styles.notice}>No completions logged yet.</Text>;
+  }
+
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+      <View style={{ flexDirection: 'row', gap: 3 }}>
+        {weeks.map((week, wi) => (
+          <View key={wi} style={{ gap: 3 }}>
+            {week.map((sq, di) => (
+              <View
+                key={di}
+                style={[
+                  styles.heatSquare,
+                  sq === null
+                    ? styles.heatSquareEmpty
+                    : sq.done
+                    ? { backgroundColor: accent }
+                    : styles.heatSquareMiss,
+                ]}
+              />
+            ))}
+          </View>
+        ))}
+      </View>
+    </ScrollView>
+  );
+}
+
+const PERIOD_NOUNS: Record<string, string> = {
+  day: 'day',
+  week: 'week',
+  month: 'month',
+};
+
+function pluralize(count: number, noun: string): string {
+  return `${count} ${noun}${count !== 1 ? 's' : ''}`;
+}
+
 export default function InsightsScreen() {
-  const { loaded, getCategoryScores } = useHabits();
+  const {
+    habits, loaded, getCategoryScores, getCategoryScoreHistory,
+    getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
+  } = useHabits();
   const { width } = useWindowDimensions();
 
   if (!loaded) return null;
 
   const categoryScores = getCategoryScores();
+  const categories = categoryScores.map(c => c.category);
+  const history = getCategoryScoreHistory();
   const chartSize = Math.min(width - 32, 340);
+  const trendWidth = width - 32;
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
         <Text style={styles.header}>Insights</Text>
-        <Text style={styles.subheader}>Category momentum (today)</Text>
 
         {categoryScores.length === 0 && (
           <Text style={styles.empty}>No habits yet — add some to see insights here.</Text>
         )}
 
         {categoryScores.length > 0 && (
-          <View style={styles.chartWrap}>
-            <RadarChart data={categoryScores} size={chartSize} />
-          </View>
-        )}
+          <>
+            <Text style={styles.subheader}>Category momentum (today)</Text>
+            <View style={styles.chartWrap}>
+              <RadarChart data={categoryScores} size={chartSize} />
+            </View>
 
-        {categoryScores.map(({ category, score }) => (
-          <View
-            key={category}
-            style={[styles.row, { backgroundColor: getCategoryColor(category) }]}
-          >
-            <Text style={styles.categoryName}>{category}</Text>
-            <Text style={styles.score}>{score}</Text>
-          </View>
-        ))}
+            {categoryScores.map(({ category, score }) => (
+              <View
+                key={category}
+                style={[styles.row, { backgroundColor: getCategoryColor(category) }]}
+              >
+                <Text style={styles.categoryName}>{category}</Text>
+                <Text style={styles.score}>{score}</Text>
+              </View>
+            ))}
+
+            <Text style={[styles.subheader, { marginTop: 24 }]}>Trend (last 90 days)</Text>
+            <View style={styles.chartWrap}>
+              <TrendLineChart
+                history={history}
+                categories={categories}
+                width={trendWidth}
+                height={200}
+              />
+            </View>
+
+            <View style={styles.legend}>
+              {categories.map(category => (
+                <View key={category} style={styles.legendItem}>
+                  <View style={[styles.legendSwatch, { backgroundColor: getCategoryAccentColor(category) }]} />
+                  <Text style={styles.legendText}>{category}</Text>
+                </View>
+              ))}
+            </View>
+
+            <Text style={[styles.subheader, { marginTop: 24 }]}>Habit history</Text>
+            {habits.map(habit => {
+              const squares = getHabitHistorySquares(habit);
+              const longest = getLongestStreak(habit);
+              const periodStreak = getPeriodStreak(habit);
+              const completionRate = getCompletionRate(habit);
+              const periodNoun = PERIOD_NOUNS[habit.targetPeriod];
+
+              return (
+                <View
+                  key={habit.id}
+                  style={[styles.habitHistoryCard, { backgroundColor: getCategoryColor(habit.category) }]}
+                >
+                  <View style={styles.habitHistoryHeader}>
+                    <Text style={styles.habitHistoryName}>{habit.name}</Text>
+                    <Text style={styles.habitHistoryStreak}>
+                      🏆 {longest} day{longest !== 1 ? 's' : ''} best
+                    </Text>
+                  </View>
+
+                  <View style={styles.statsRow}>
+                    <Text style={styles.statText}>
+                      🔥 {pluralize(periodStreak, periodNoun)} in a row
+                    </Text>
+                    {completionRate.total > 0 ? (
+                      <Text style={styles.statText}>
+                        {completionRate.rate}% of {periodNoun}s met ({completionRate.met}/{completionRate.total})
+                      </Text>
+                    ) : (
+                      <Text style={styles.statText}>Not enough history yet</Text>
+                    )}
+                  </View>
+
+                  <HabitHeatmap habit={habit} squares={squares} />
+                </View>
+              );
+            })}
+          </>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -172,4 +353,26 @@ const styles = StyleSheet.create({
   },
   categoryName: { fontSize: 17, fontWeight: '600' },
   score: { fontSize: 20, fontWeight: '700', color: '#333' },
+  legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 8 },
+  legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  legendSwatch: { width: 12, height: 12, borderRadius: 3 },
+  legendText: { fontSize: 12, color: '#666' },
+  habitHistoryCard: {
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  habitHistoryHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  habitHistoryName: { fontSize: 16, fontWeight: '600' },
+  habitHistoryStreak: { fontSize: 13, color: '#555', fontWeight: '600' },
+  statsRow: { marginBottom: 8, gap: 2 },
+  statText: { fontSize: 12, color: '#666' },
+  heatSquare: { width: 11, height: 11, borderRadius: 2 },
+  heatSquareEmpty: { backgroundColor: 'transparent' },
+  heatSquareMiss: { backgroundColor: 'rgba(0,0,0,0.08)' },
 });
