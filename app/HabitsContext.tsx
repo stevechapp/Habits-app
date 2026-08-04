@@ -23,6 +23,10 @@ export type PeriodInfo = {
   squares: { date: string; done: boolean }[];
 };
 
+export type MomentumPoint = { date: string; score: number };
+export type CategoryScore = { category: string; score: number };
+export type CategoryScoreHistoryPoint = { date: string; scores: Record<string, number> };
+
 type StoredData = {
   version: number;
   habits: Habit[];
@@ -44,11 +48,23 @@ type HabitsContextType = {
   moveHabit: (id: string, direction: 'up' | 'down') => void;
   getStreak: (habit: Habit) => number;
   getPeriodInfo: (habit: Habit) => PeriodInfo;
+  getHabitMomentumSeries: (habit: Habit) => MomentumPoint[];
+  getCategoryScores: () => CategoryScore[];
+  getCategoryScoreHistory: () => CategoryScoreHistoryPoint[];
 };
 
 const STORAGE_KEY = 'habits';
 const CURRENT_VERSION = 3;
 const DEFAULT_CATEGORY = 'Uncategorized';
+
+// Momentum scoring config — kept as named constants so it's easy to tune
+// or later expose as per-habit overrides (e.g. for combo/gamification features).
+const MOMENTUM_WINDOW_DAYS = 90;
+const MOMENTUM_BASELINE = 50;
+const MOMENTUM_GAIN = 10;
+const MOMENTUM_DECAY = 2;
+const MOMENTUM_MIN = 0;
+const MOMENTUM_MAX = 100;
 
 const defaultHabits: Habit[] = [
   { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
@@ -56,16 +72,9 @@ const defaultHabits: Habit[] = [
   { id: '3', name: 'Read', category: 'Mind', timeOfDay: 'evening', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
 ];
 
-// Soft, low-saturation palette — subtle enough not to clash with the done/not-done row tint.
 const CATEGORY_PALETTE = [
-  '#F3E8FF', // lavender
-  '#E0F2FE', // sky
-  '#DCFCE7', // mint
-  '#FEF3C7', // cream
-  '#FCE7F3', // blush
-  '#E7E5E4', // stone
-  '#FFEDD5', // peach
-  '#E0E7FF', // periwinkle
+  '#F3E8FF', '#E0F2FE', '#DCFCE7', '#FEF3C7',
+  '#FCE7F3', '#E7E5E4', '#FFEDD5', '#E0E7FF',
 ];
 
 export function getCategoryColor(category: string): string {
@@ -108,7 +117,6 @@ function calculateStreak(completions: Record<string, boolean>, today: string): n
   return streak;
 }
 
-// Upgrades any old stored shape into the current Habit shape.
 function migrateHabits(oldHabits: any[]): Habit[] {
   return oldHabits.map((h, index) => ({
     id: h.id,
@@ -180,6 +188,38 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
   }
 
   return { status, completedCount, targetCount: habit.targetCount, squares };
+}
+
+// Walks day-by-day over the momentum window, evolving a 0-100 score per habit.
+// Gains on completed days; decays only once a period is genuinely unmakeable
+// ('behind'), so there's no penalty while a target is still achievable.
+function calculateMomentumSeries(habit: Habit, today: string, windowDays: number): MomentumPoint[] {
+  const series: MomentumPoint[] = [];
+  const startCursor = new Date(today);
+  startCursor.setDate(startCursor.getDate() - (windowDays - 1));
+
+  let score = MOMENTUM_BASELINE;
+  const cursor = new Date(startCursor);
+
+  for (let i = 0; i < windowDays; i++) {
+    const dateStr = dateToString(cursor);
+    const doneThatDay = habit.completions[dateStr] === true;
+
+    if (doneThatDay) {
+      score = Math.min(MOMENTUM_MAX, score + MOMENTUM_GAIN);
+    } else {
+      const info = calculatePeriodInfo(habit, dateStr);
+      if (info.status === 'behind') {
+        score = Math.max(MOMENTUM_MIN, score - MOMENTUM_DECAY);
+      }
+      // onTrack / dueSoon / met -> no change, still achievable or already done
+    }
+
+    series.push({ date: dateStr, score });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return series;
 }
 
 const HabitsContext = createContext<HabitsContextType | undefined>(undefined);
@@ -278,7 +318,6 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     ));
   }
 
-  // Swaps order values with the neighboring habit within the same time-of-day group.
   function moveHabit(id: string, direction: 'up' | 'down') {
     const target = habits.find(h => h.id === id);
     if (!target) return;
@@ -308,6 +347,61 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return calculatePeriodInfo(habit, selectedDate);
   }
 
+  function getHabitMomentumSeries(habit: Habit): MomentumPoint[] {
+    return calculateMomentumSeries(habit, today, MOMENTUM_WINDOW_DAYS);
+  }
+
+  // Today's momentum snapshot per category, averaged across that category's habits.
+  // Feeds the spider/radar chart (one axis per category).
+  function getCategoryScores(): CategoryScore[] {
+    const categories = Array.from(new Set(habits.map(h => h.category)));
+    return categories.map(category => {
+      const habitsInCategory = habits.filter(h => h.category === category);
+      const latestScores = habitsInCategory.map(h => {
+        const series = calculateMomentumSeries(h, today, MOMENTUM_WINDOW_DAYS);
+        return series[series.length - 1]?.score ?? MOMENTUM_BASELINE;
+      });
+      const avg = latestScores.length > 0
+        ? latestScores.reduce((sum, s) => sum + s, 0) / latestScores.length
+        : MOMENTUM_BASELINE;
+      return { category, score: Math.round(avg) };
+    });
+  }
+
+  // Full 90-day trend, per category, for a line/area chart.
+  function getCategoryScoreHistory(): CategoryScoreHistoryPoint[] {
+    const categories = Array.from(new Set(habits.map(h => h.category)));
+
+    // Precompute each habit's full series once.
+    const habitSeries = habits.map(h => ({
+      category: h.category,
+      series: calculateMomentumSeries(h, today, MOMENTUM_WINDOW_DAYS),
+    }));
+
+    const history: CategoryScoreHistoryPoint[] = [];
+
+    for (let i = 0; i < MOMENTUM_WINDOW_DAYS; i++) {
+      const fallbackDate = new Date(today);
+      fallbackDate.setDate(fallbackDate.getDate() - (MOMENTUM_WINDOW_DAYS - 1 - i));
+      const date = habitSeries[0]?.series[i]?.date ?? dateToString(fallbackDate);
+
+      const scores: Record<string, number> = {};
+      categories.forEach(category => {
+        const pointsForCategory = habitSeries
+          .filter(hs => hs.category === category)
+          .map(hs => hs.series[i]?.score ?? MOMENTUM_BASELINE);
+        const avg = pointsForCategory.length > 0
+          ? pointsForCategory.reduce((sum, s) => sum + s, 0) / pointsForCategory.length
+          : MOMENTUM_BASELINE;
+        scores[category] = Math.round(avg);
+      });
+
+      history.push({ date, scores });
+    }
+
+    return history;
+  }
+
   return (
     <HabitsContext.Provider
       value={{
@@ -326,6 +420,9 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         moveHabit,
         getStreak,
         getPeriodInfo,
+        getHabitMomentumSeries,
+        getCategoryScores,
+        getCategoryScoreHistory,
       }}
     >
       {children}
