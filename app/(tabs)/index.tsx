@@ -1,98 +1,196 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, SectionList, SafeAreaView, View } from 'react-native';
+import { useHabits, PeriodStatus, TimeOfDay, getCategoryColor } from '../HabitsContext';
 
-import { HelloWave } from '@/components/hello-wave';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+function formatDateLabel(dateStr: string, today: string): string {
+  if (dateStr === today) return 'Today';
+
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayStr = yesterday.toISOString().split('T')[0];
+  if (dateStr === yesterdayStr) return 'Yesterday';
+
+  const d = new Date(dateStr);
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+const STATUS_LABELS: Record<PeriodStatus, string> = {
+  met: 'Target met',
+  onTrack: 'On track',
+  dueSoon: 'Due soon',
+  behind: 'Behind',
+};
+
+const STATUS_COLORS: Record<PeriodStatus, string> = {
+  met: '#27ae60',
+  onTrack: '#888',
+  dueSoon: '#e67e22',
+  behind: '#c0392b',
+};
+
+const TIME_ORDER: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
+const TIME_LABELS: Record<TimeOfDay, string> = {
+  morning: 'Morning',
+  afternoon: 'Afternoon',
+  evening: 'Evening',
+};
 
 export default function HomeScreen() {
-  return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
-      headerImage={
-        <Image
-          source={require('@/assets/images/partial-react-logo.png')}
-          style={styles.reactLogo}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
-              />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
+  const {
+    habits, loaded, today, selectedDate,
+    goToPreviousDay, goToNextDay, goToToday, isViewingToday,
+    toggleHabit, getStreak, getPeriodInfo,
+  } = useHabits();
 
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
-    </ParallaxScrollView>
+  if (!loaded) return null;
+
+  const sections = TIME_ORDER
+    .map(timeOfDay => ({
+      title: TIME_LABELS[timeOfDay],
+      data: habits
+        .filter(h => h.timeOfDay === timeOfDay)
+        .sort((a, b) => a.order - b.order),
+    }))
+    .filter(section => section.data.length > 0);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <Text style={styles.header}>Habits</Text>
+
+      <View style={styles.dateNav}>
+        <TouchableOpacity onPress={goToPreviousDay} style={styles.navButton}>
+          <Text style={styles.navArrow}>←</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={goToToday}>
+          <Text style={styles.dateLabel}>{formatDateLabel(selectedDate, today)}</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          onPress={goToNextDay}
+          disabled={isViewingToday}
+          style={styles.navButton}
+        >
+          <Text style={[styles.navArrow, isViewingToday && styles.navArrowDisabled]}>→</Text>
+        </TouchableOpacity>
+      </View>
+
+      <SectionList
+        sections={sections}
+        keyExtractor={item => item.id}
+        stickySectionHeadersEnabled={false}
+        renderSectionHeader={({ section }) => (
+          <View style={styles.sectionHeaderWrap}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.sectionHeaderText}>{section.title}</Text>
+            <View style={styles.dividerLine} />
+          </View>
+        )}
+        renderItem={({ item }) => {
+          const doneThatDay = item.completions[selectedDate] === true;
+          const streak = getStreak(item);
+          const periodInfo = getPeriodInfo(item);
+          const isDaily = item.targetPeriod === 'day';
+          const rowColor = doneThatDay ? '#d9f2d9' : getCategoryColor(item.category);
+
+          return (
+            <TouchableOpacity
+              style={[styles.habitRow, { backgroundColor: rowColor }]}
+              onPress={() => toggleHabit(item.id)}
+            >
+              <View style={{ flex: 1 }}>
+                <View style={styles.titleRow}>
+                  <Text style={styles.habitText}>{item.name}</Text>
+                  <View style={styles.categoryTag}>
+                    <Text style={styles.categoryTagText}>{item.category}</Text>
+                  </View>
+                </View>
+
+                <Text style={styles.habitMeta}>
+                  {item.targetCount}× per {item.targetPeriod}
+                </Text>
+
+                {!isDaily && (
+                  <>
+                    <View style={styles.squaresRow}>
+                      {periodInfo.squares.map(sq => (
+                        <View
+                          key={sq.date}
+                          style={[styles.square, sq.done ? styles.squareDone : styles.squareEmpty]}
+                        />
+                      ))}
+                    </View>
+                    <Text style={[styles.statusText, { color: STATUS_COLORS[periodInfo.status] }]}>
+                      {STATUS_LABELS[periodInfo.status]} · {periodInfo.completedCount}/{periodInfo.targetCount}
+                    </Text>
+                  </>
+                )}
+
+                {isViewingToday && streak > 0 && (
+                  <Text style={styles.streakText}>🔥 {streak} day{streak !== 1 ? 's' : ''}</Text>
+                )}
+              </View>
+              <Text style={styles.checkmark}>{doneThatDay ? '✅' : '⬜️'}</Text>
+            </TouchableOpacity>
+          );
+        }}
+      />
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  titleContainer: {
+  container: { flex: 1, backgroundColor: '#fff', paddingHorizontal: 16, paddingTop: 20 },
+  header: { fontSize: 28, fontWeight: 'bold', marginBottom: 16 },
+  dateNav: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    justifyContent: 'center',
+    marginBottom: 20,
+    gap: 24,
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
+  navButton: { padding: 8 },
+  navArrow: { fontSize: 20, color: '#333' },
+  navArrowDisabled: { color: '#ccc' },
+  dateLabel: { fontSize: 17, fontWeight: '600', minWidth: 140, textAlign: 'center' },
+  sectionHeaderWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 14,
+    marginBottom: 10,
+    gap: 10,
   },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
+  dividerLine: { flex: 1, height: 1, backgroundColor: '#e5e5e5' },
+  sectionHeaderText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#999',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
   },
+  habitRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  habitText: { fontSize: 18 },
+  categoryTag: {
+    backgroundColor: 'rgba(0,0,0,0.06)',
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  categoryTagText: { fontSize: 11, color: '#555', fontWeight: '600' },
+  habitMeta: { fontSize: 13, color: '#888', marginTop: 2, textTransform: 'capitalize' },
+  squaresRow: { flexDirection: 'row', gap: 4, marginTop: 6, flexWrap: 'wrap' },
+  square: { width: 12, height: 12, borderRadius: 3 },
+  squareDone: { backgroundColor: '#27ae60' },
+  squareEmpty: { backgroundColor: 'rgba(0,0,0,0.12)' },
+  statusText: { fontSize: 12, marginTop: 4, fontWeight: '600' },
+  streakText: { fontSize: 13, color: '#e67e22', marginTop: 2 },
+  checkmark: { fontSize: 20 },
 });
