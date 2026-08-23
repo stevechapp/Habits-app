@@ -1,5 +1,5 @@
 import { StyleSheet, Text, TouchableOpacity, SectionList, SafeAreaView, View } from 'react-native';
-import { useHabits, PeriodStatus, TimeOfDay, getCategoryColor } from '../HabitsContext';
+import { useHabits, PeriodStatus, TimeOfDay } from '../HabitsContext';
 
 function formatDateLabel(dateStr: string, today: string): string {
   if (dateStr === today) return 'Today';
@@ -38,7 +38,7 @@ export default function HomeScreen() {
   const {
     habits, loaded, today, selectedDate,
     goToPreviousDay, goToNextDay, goToToday, isViewingToday,
-    toggleHabit, getStreak, getPeriodInfo,
+    toggleHabit, getStreak, getPeriodInfo, getCategoryColor,
   } = useHabits();
 
   if (!loaded) return null;

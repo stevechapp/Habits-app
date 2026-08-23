@@ -1,6 +1,6 @@
 import { StyleSheet, Text, SafeAreaView, View, ScrollView, useWindowDimensions } from 'react-native';
 import Svg, { Polygon, Polyline, Line, Circle, Text as SvgText } from 'react-native-svg';
-import { useHabits, getCategoryColor, getCategoryAccentColor, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate } from '../HabitsContext';
+import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate } from '../HabitsContext';
 
 const GRID_LEVELS = [0.25, 0.5, 0.75, 1.0];
 const CHART_ACCENT = '#7c3aed';
@@ -104,6 +104,7 @@ function TrendLineChart({
   width: number;
   height: number;
 }) {
+  const { getCategoryAccentColor } = useHabits();
   const paddingLeft = 32;
   const paddingRight = 12;
   const paddingTop = 12;
@@ -189,6 +190,7 @@ function buildWeekColumns(squares: HistorySquare[]): (HistorySquare | null)[][] 
 }
 
 function HabitHeatmap({ habit, squares }: { habit: Habit; squares: HistorySquare[] }) {
+  const { getCategoryAccentColor } = useHabits();
   const weeks = buildWeekColumns(squares);
   const accent = getCategoryAccentColor(habit.category);
 
@@ -235,6 +237,7 @@ export default function InsightsScreen() {
   const {
     habits, loaded, getCategoryScores, getCategoryScoreHistory,
     getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
+    getCategoryColor, getCategoryAccentColor,
   } = useHabits();
   const { width } = useWindowDimensions();
 

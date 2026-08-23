@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef } from 'react';
 import { StyleSheet, Text, TextInput, TouchableOpacity, FlatList, SafeAreaView, View } from 'react-native';
-import { useHabits, TimeOfDay, Period, getCategoryColor } from '../HabitsContext';
+import { useHabits, TimeOfDay, Period } from '../HabitsContext';
 
 const TIME_OPTIONS: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
 const PERIOD_OPTIONS: Period[] = ['day', 'week', 'month'];
@@ -66,7 +66,7 @@ function CategoryInput({
 }
 
 export default function ManageScreen() {
-  const { habits, addHabit, deleteHabit, editHabit, moveHabit } = useHabits();
+  const { habits, addHabit, deleteHabit, editHabit, moveHabit, getCategoryColor } = useHabits();
 
   const existingCategories = useMemo(() => {
     const set = new Set(habits.map(h => h.category).filter(c => c && c !== 'Uncategorized'));
@@ -139,7 +139,6 @@ export default function ManageScreen() {
     );
   }
 
-  // Sort for display: group by time-of-day, ordered within each group — matches Today screen ordering.
   const timeOrder: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
   const sortedHabits = [...habits].sort((a, b) => {
     const timeDiff = timeOrder.indexOf(a.timeOfDay) - timeOrder.indexOf(b.timeOfDay);
