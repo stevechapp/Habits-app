@@ -1,4 +1,4 @@
-import { StyleSheet, Text, TouchableOpacity, SectionList, SafeAreaView, View } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, SectionList, SafeAreaView, View, Switch } from 'react-native';
 import { useHabits, PeriodStatus, TimeOfDay } from '../HabitsContext';
 
 function formatDateLabel(dateStr: string, today: string): string {
@@ -39,17 +39,19 @@ export default function HomeScreen() {
     habits, loaded, today, selectedDate,
     goToPreviousDay, goToNextDay, goToToday, isViewingToday,
     toggleHabit, getStreak, getPeriodInfo, getCategoryColor,
+    viewMode, setViewMode, getOrderedHabits,
+    hideCompleted, setHideCompleted, shouldShowHabit,
   } = useHabits();
 
   if (!loaded) return null;
 
   const sections = TIME_ORDER
-    .map(timeOfDay => ({
-      title: TIME_LABELS[timeOfDay],
-      data: habits
-        .filter(h => h.timeOfDay === timeOfDay)
-        .sort((a, b) => a.order - b.order),
-    }))
+    .map(timeOfDay => {
+      const group = habits.filter(h => h.timeOfDay === timeOfDay);
+      const ordered = getOrderedHabits(group);
+      const visible = ordered.filter(shouldShowHabit);
+      return { title: TIME_LABELS[timeOfDay], data: visible };
+    })
     .filter(section => section.data.length > 0);
 
   return (
@@ -72,6 +74,32 @@ export default function HomeScreen() {
         >
           <Text style={[styles.navArrow, isViewingToday && styles.navArrowDisabled]}>→</Text>
         </TouchableOpacity>
+      </View>
+
+      <View style={styles.controlsRow}>
+        <View style={styles.modeToggle}>
+          <TouchableOpacity
+            style={[styles.modeButton, viewMode === 'static' && styles.modeButtonActive]}
+            onPress={() => setViewMode('static')}
+          >
+            <Text style={[styles.modeButtonText, viewMode === 'static' && styles.modeButtonTextActive]}>
+              Static
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeButton, viewMode === 'dynamic' && styles.modeButtonActive]}
+            onPress={() => setViewMode('dynamic')}
+          >
+            <Text style={[styles.modeButtonText, viewMode === 'dynamic' && styles.modeButtonTextActive]}>
+              Dynamic
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.hideRow}>
+          <Text style={styles.hideLabel}>Hide completed</Text>
+          <Switch value={hideCompleted} onValueChange={setHideCompleted} />
+        </View>
       </View>
 
       <SectionList
@@ -145,13 +173,35 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 20,
+    marginBottom: 16,
     gap: 24,
   },
   navButton: { padding: 8 },
   navArrow: { fontSize: 20, color: '#333' },
   navArrowDisabled: { color: '#ccc' },
   dateLabel: { fontSize: 17, fontWeight: '600', minWidth: 140, textAlign: 'center' },
+  controlsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  modeToggle: {
+    flexDirection: 'row',
+    backgroundColor: '#f0f0f0',
+    borderRadius: 8,
+    padding: 2,
+  },
+  modeButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+  },
+  modeButtonActive: { backgroundColor: '#333' },
+  modeButtonText: { fontSize: 13, color: '#666', fontWeight: '600' },
+  modeButtonTextActive: { color: '#fff' },
+  hideRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  hideLabel: { fontSize: 13, color: '#666' },
   sectionHeaderWrap: {
     flexDirection: 'row',
     alignItems: 'center',

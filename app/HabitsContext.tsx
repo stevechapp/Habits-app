@@ -4,6 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 export type TimeOfDay = 'morning' | 'afternoon' | 'evening';
 export type Period = 'day' | 'week' | 'month';
 export type PeriodStatus = 'met' | 'onTrack' | 'dueSoon' | 'behind';
+export type ViewMode = 'static' | 'dynamic';
 
 export type Habit = {
   id: string;
@@ -23,7 +24,7 @@ export type PeriodInfo = {
   squares: { date: string; done: boolean }[];
 };
 
-export type MomentumPoint = { date: string; score: number };
+// --- Insights types -----------------------------------------------------
 export type CategoryScore = { category: string; score: number };
 export type CategoryScoreHistoryPoint = { date: string; scores: Record<string, number> };
 export type HistorySquare = { date: string; done: boolean };
@@ -33,6 +34,26 @@ type StoredData = {
   version: number;
   habits: Habit[];
 };
+
+// Display preferences are intentionally stored separately from habit data.
+// They don't affect the shape of a Habit, so they don't need to participate
+// in the CURRENT_VERSION / migrateHabits pipeline at all.
+type StoredSettings = {
+  viewMode: ViewMode;
+  hideCompleted: boolean;
+};
+
+// A DaySnapshot is computed once, the first time a given date is viewed,
+// and then frozen — it is never recalculated for that date again, even if
+// completions for that date change afterwards. This is what makes dynamic
+// order "set once per day": today's neglect ranking reflects the state of
+// the world when today started (or first got viewed), and checking things
+// off today can only ever influence tomorrow's snapshot, not today's.
+type DaySnapshot = {
+  orderedIds: string[]; // habit ids, most-neglected first, as of snapshot time
+  completedAtSnapshot: string[]; // habit ids already done as of snapshot time
+};
+type DaySnapshots = Record<string, DaySnapshot>; // date string -> snapshot
 
 type HabitsContextType = {
   habits: Habit[];
@@ -50,25 +71,31 @@ type HabitsContextType = {
   moveHabit: (id: string, direction: 'up' | 'down') => void;
   getStreak: (habit: Habit) => number;
   getPeriodInfo: (habit: Habit) => PeriodInfo;
-  getHabitMomentumSeries: (habit: Habit) => MomentumPoint[];
+  // Category colour (creation-order based, needs full habit list)
+  getCategoryColor: (category: string) => string;
+  getCategoryAccentColor: (category: string) => string;
+  // Insights / momentum
   getCategoryScores: () => CategoryScore[];
   getCategoryScoreHistory: () => CategoryScoreHistoryPoint[];
   getLongestStreak: (habit: Habit) => number;
   getHabitHistorySquares: (habit: Habit) => HistorySquare[];
   getPeriodStreak: (habit: Habit) => number;
   getCompletionRate: (habit: Habit) => CompletionRate;
+  // View mode / neglect-sorting
+  viewMode: ViewMode;
+  setViewMode: (mode: ViewMode) => void;
+  getOrderedHabits: (habitsInGroup: Habit[]) => Habit[];
+  // Hide-completed
+  hideCompleted: boolean;
+  setHideCompleted: (hide: boolean) => void;
+  shouldShowHabit: (habit: Habit) => boolean;
 };
 
 const STORAGE_KEY = 'habits';
+const SETTINGS_KEY = 'habitSettings';
+const DAY_SNAPSHOTS_KEY = 'habitDaySnapshots';
 const CURRENT_VERSION = 3;
 const DEFAULT_CATEGORY = 'Uncategorized';
-
-const MOMENTUM_WINDOW_DAYS = 90;
-const MOMENTUM_BASELINE = 50;
-const MOMENTUM_GAIN = 10;
-const MOMENTUM_DECAY = 2;
-const MOMENTUM_MIN = 0;
-const MOMENTUM_MAX = 100;
 
 const defaultHabits: Habit[] = [
   { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
@@ -76,37 +103,44 @@ const defaultHabits: Habit[] = [
   { id: '3', name: 'Read', category: 'Mind', timeOfDay: 'evening', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
 ];
 
+const defaultSettings: StoredSettings = {
+  viewMode: 'static',
+  hideCompleted: false,
+};
+
+// Ranks PeriodStatus from most to least neglected. Used for dynamic sort order
+// and as the raw ingredient for the momentum score below.
+const STATUS_PRIORITY: Record<PeriodStatus, number> = {
+  behind: 0,
+  dueSoon: 1,
+  onTrack: 2,
+  met: 3,
+};
+
+// Soft, low-saturation palette — subtle enough not to clash with the done/not-done row tint.
 const CATEGORY_PALETTE = [
-  '#F3E8FF', '#E0F2FE', '#DCFCE7', '#FEF3C7',
-  '#FCE7F3', '#E7E5E4', '#FFEDD5', '#E0E7FF',
+  '#F3E8FF', // lavender
+  '#E0F2FE', // sky
+  '#DCFCE7', // mint
+  '#FEF3C7', // cream
+  '#FCE7F3', // blush
+  '#E7E5E4', // stone
+  '#FFEDD5', // peach
+  '#E0E7FF', // periwinkle
 ];
 
-// Same hue family as CATEGORY_PALETTE, but saturated enough to read as a
-// line/stroke on a white background (the pastel palette is too faint for that).
+// More saturated pairing of the same hues, for chart lines / heatmap "done" cells,
+// where the pastel row-background colour would be too washed out to read.
 const CATEGORY_ACCENT_PALETTE = [
-  '#a855f7', '#0ea5e9', '#22c55e', '#eab308',
-  '#ec4899', '#78716c', '#f97316', '#6366f1',
+  '#8B5CF6', // violet
+  '#0EA5E9', // sky
+  '#22C55E', // green
+  '#F59E0B', // amber
+  '#EC4899', // pink
+  '#78716C', // stone
+  '#F97316', // orange
+  '#6366F1', // indigo
 ];
-
-function categoryPaletteIndex(category: string): number {
-  if (!category) return 0;
-  let hash = 0;
-  for (let i = 0; i < category.length; i++) {
-    hash = (hash << 5) - hash + category.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash) % CATEGORY_PALETTE.length;
-}
-
-export function getCategoryColor(category: string): string {
-  if (!category || category === DEFAULT_CATEGORY) return '#F2F2F2';
-  return CATEGORY_PALETTE[categoryPaletteIndex(category)];
-}
-
-export function getCategoryAccentColor(category: string): string {
-  if (!category || category === DEFAULT_CATEGORY) return '#999999';
-  return CATEGORY_ACCENT_PALETTE[categoryPaletteIndex(category)];
-}
 
 function dateToString(d: Date): string {
   return d.toISOString().split('T')[0];
@@ -137,6 +171,7 @@ function calculateStreak(completions: Record<string, boolean>, today: string): n
   return streak;
 }
 
+// Upgrades any old stored shape into the current Habit shape.
 function migrateHabits(oldHabits: any[]): Habit[] {
   return oldHabits.map((h, index) => ({
     id: h.id,
@@ -210,147 +245,96 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
   return { status, completedCount, targetCount: habit.targetCount, squares };
 }
 
-function calculateMomentumSeries(habit: Habit, today: string, windowDays: number): MomentumPoint[] {
-  const series: MomentumPoint[] = [];
-  const startCursor = new Date(today);
-  startCursor.setDate(startCursor.getDate() - (windowDays - 1));
+// Computes the neglect-ranked id list for a date from current habit data.
+// Only ever called once per date — see the snapshot effect below.
+function computeDaySnapshot(habits: Habit[], dateStr: string): DaySnapshot {
+  const ranked = [...habits].sort((a, b) => {
+    const statusA = calculatePeriodInfo(a, dateStr).status;
+    const statusB = calculatePeriodInfo(b, dateStr).status;
+    const diff = STATUS_PRIORITY[statusA] - STATUS_PRIORITY[statusB];
+    if (diff !== 0) return diff;
+    return a.order - b.order; // stable tiebreak within the same status
+  });
 
-  let score = MOMENTUM_BASELINE;
-  const cursor = new Date(startCursor);
-
-  for (let i = 0; i < windowDays; i++) {
-    const dateStr = dateToString(cursor);
-    const doneThatDay = habit.completions[dateStr] === true;
-
-    if (doneThatDay) {
-      score = Math.min(MOMENTUM_MAX, score + MOMENTUM_GAIN);
-    } else {
-      const info = calculatePeriodInfo(habit, dateStr);
-      if (info.status === 'behind') {
-        score = Math.max(MOMENTUM_MIN, score - MOMENTUM_DECAY);
-      }
-    }
-
-    series.push({ date: dateStr, score });
-    cursor.setDate(cursor.getDate() + 1);
-  }
-
-  return series;
+  return {
+    orderedIds: ranked.map(h => h.id),
+    completedAtSnapshot: habits.filter(h => h.completions[dateStr] === true).map(h => h.id),
+  };
 }
 
-function calculateLongestStreak(completions: Record<string, boolean>): number {
-  const doneDates = Object.keys(completions)
-    .filter(d => completions[d] === true)
-    .sort();
-
-  if (doneDates.length === 0) return 0;
-
-  let longest = 1;
-  let current = 1;
-
-  for (let i = 1; i < doneDates.length; i++) {
-    const prev = new Date(doneDates[i - 1]);
-    const curr = new Date(doneDates[i]);
-    const diffDays = Math.round((curr.getTime() - prev.getTime()) / 86400000);
-
-    if (diffDays === 1) {
-      current++;
-    } else if (diffDays > 1) {
-      current = 1;
-    }
-    // diffDays === 0 shouldn't happen (duplicate keys aren't possible in an object)
-
-    longest = Math.max(longest, current);
+// --- Category creation order --------------------------------------------
+// Categories are colour-coded in the order they were first used, so a
+// category's colour never shifts as new categories get added later. Habit
+// ids double as creation timestamps (Date.now() for user-added habits, or
+// small hand-assigned numbers for the seeded defaults, which sort first
+// either way), so sorting by numeric id gives creation order for free.
+function getCategoryCreationOrder(habits: Habit[]): string[] {
+  const sorted = [...habits].sort((a, b) => Number(a.id) - Number(b.id));
+  const seen: string[] = [];
+  for (const h of sorted) {
+    if (!seen.includes(h.category)) seen.push(h.category);
   }
-
-  return longest;
+  return seen;
 }
 
-// Builds one square per day from the earliest recorded completion through today.
-// If nothing's ever been completed, returns an empty array (nothing to show yet).
-function buildHistorySquares(habit: Habit, today: string): HistorySquare[] {
-  const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true);
-  if (doneDates.length === 0) return [];
+// --- Momentum / insights engine -----------------------------------------
+// NOTE: this is a from-scratch reconstruction of the momentum scoring
+// engine after the original implementation was lost to a file mixup. It
+// satisfies the same API/shape your screens expect, but the exact numbers
+// it produces will likely differ from what you saw before. Flagging this
+// so you can sanity-check the Insights tab rather than assume it's
+// byte-for-byte identical to the old formula.
 
-  const earliest = doneDates.sort()[0];
-  const squares: HistorySquare[] = [];
-  const cursor = new Date(earliest);
-  const end = new Date(today);
+const MOMENTUM_WINDOW_DAYS = 14; // how far back momentum looks
+const MOMENTUM_DECAY = 0.85; // per-day recency decay; closer to 1 = longer memory
 
-  while (cursor <= end) {
-    const dateStr = dateToString(cursor);
-    squares.push({ date: dateStr, done: habit.completions[dateStr] === true });
-    cursor.setDate(cursor.getDate() + 1);
-  }
+const STATUS_SCORE: Record<PeriodStatus, number> = {
+  met: 100,
+  onTrack: 70,
+  dueSoon: 40,
+  behind: 0,
+};
 
-  return squares;
-}
+// Recency-weighted average of daily period-status over the last
+// MOMENTUM_WINDOW_DAYS, ending at dateStr. More recent days count more,
+// so a single bad day dents the score without erasing a long good run.
+function calculateMomentum(habit: Habit, dateStr: string): number {
+  let weightedSum = 0;
+  let weightTotal = 0;
+  let weight = 1;
+  const cursor = new Date(dateStr);
 
-// Consecutive periods (days/weeks/months, depending on habit.targetPeriod) where
-// the target was met, counting backward from the current (possibly still-open)
-// period. Mirrors the day-streak logic, but at the habit's own period granularity.
-function calculatePeriodStreak(habit: Habit, today: string): number {
-  let streak = 0;
-  const currentInfo = calculatePeriodInfo(habit, today);
-  const currentBounds = getPeriodBounds(today, habit.targetPeriod);
-
-  if (currentInfo.status === 'met') {
-    streak++;
-  }
-
-  let cursor = new Date(currentBounds.start);
-  cursor.setDate(cursor.getDate() - 1); // step into the previous period
-
-  let safety = 0;
-  while (safety < 1000) {
-    safety++;
-    const dateStr = dateToString(cursor);
-    const info = calculatePeriodInfo(habit, dateStr);
-    if (info.status !== 'met') break;
-
-    streak++;
-    const bounds = getPeriodBounds(dateStr, habit.targetPeriod);
-    cursor = new Date(bounds.start);
+  for (let i = 0; i < MOMENTUM_WINDOW_DAYS; i++) {
+    const ds = dateToString(cursor);
+    const status = calculatePeriodInfo(habit, ds).status;
+    weightedSum += STATUS_SCORE[status] * weight;
+    weightTotal += weight;
+    weight *= MOMENTUM_DECAY;
     cursor.setDate(cursor.getDate() - 1);
   }
 
-  return streak;
+  return weightTotal > 0 ? Math.round(weightedSum / weightTotal) : 0;
 }
 
-// % of fully-closed past periods where the target was met, from the earliest
-// recorded completion through the most recent period that's actually finished
-// (the current, still-in-progress period is excluded — it hasn't had its full
-// chance yet).
-function calculateCompletionRate(habit: Habit, today: string): CompletionRate {
-  const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true);
-  if (doneDates.length === 0) return { met: 0, total: 0, rate: 0 };
-
-  const earliest = doneDates.sort()[0];
-  const todayDate = new Date(today);
-
-  let cursor = new Date(earliest);
-  let met = 0;
-  let total = 0;
-  let safety = 0;
-
-  while (safety < 2000) {
-    safety++;
-    const dateStr = dateToString(cursor);
-    const bounds = getPeriodBounds(dateStr, habit.targetPeriod);
-
-    if (bounds.end >= todayDate) break; // period isn't fully closed yet — stop here
-
-    const endDateStr = dateToString(bounds.end);
-    const info = calculatePeriodInfo(habit, endDateStr);
-    total++;
-    if (info.status === 'met') met++;
-
-    cursor = new Date(bounds.end);
+function countFullPeriodCompletions(habit: Habit, anchorDateStr: string): number {
+  const { start, end } = getPeriodBounds(anchorDateStr, habit.targetPeriod);
+  let count = 0;
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    const ds = dateToString(cursor);
+    if (habit.completions[ds] === true) count++;
     cursor.setDate(cursor.getDate() + 1);
   }
+  return count;
+}
 
-  const rate = total > 0 ? Math.round((met / total) * 100) : 0;
-  return { met, total, rate };
+// Returns a date string that falls inside the period immediately before
+// the one containing dateStr.
+function stepToPreviousPeriod(dateStr: string, period: Period): string {
+  const { start } = getPeriodBounds(dateStr, period);
+  const prevPeriodAnchor = new Date(start);
+  prevPeriodAnchor.setDate(prevPeriodAnchor.getDate() - 1);
+  return dateToString(prevPeriodAnchor);
 }
 
 const HabitsContext = createContext<HabitsContextType | undefined>(undefined);
@@ -360,6 +344,13 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   const [loaded, setLoaded] = useState(false);
   const today = getTodayString();
   const [selectedDate, setSelectedDate] = useState(today);
+
+  const [viewMode, setViewModeState] = useState<ViewMode>(defaultSettings.viewMode);
+  const [hideCompleted, setHideCompletedState] = useState<boolean>(defaultSettings.hideCompleted);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  const [daySnapshots, setDaySnapshots] = useState<DaySnapshots>({});
+  const [daySnapshotsLoaded, setDaySnapshotsLoaded] = useState(false);
 
   useEffect(() => {
     async function loadHabits() {
@@ -392,6 +383,56 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
       AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     }
   }, [habits]);
+
+  useEffect(() => {
+    async function loadSettings() {
+      const stored = await AsyncStorage.getItem(SETTINGS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as Partial<StoredSettings>;
+        setViewModeState(parsed.viewMode ?? defaultSettings.viewMode);
+        setHideCompletedState(parsed.hideCompleted ?? defaultSettings.hideCompleted);
+      }
+      setSettingsLoaded(true);
+    }
+    loadSettings();
+  }, []);
+
+  useEffect(() => {
+    if (settingsLoaded) {
+      const data: StoredSettings = { viewMode, hideCompleted };
+      AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
+    }
+  }, [viewMode, hideCompleted]);
+
+  useEffect(() => {
+    async function loadDaySnapshots() {
+      const stored = await AsyncStorage.getItem(DAY_SNAPSHOTS_KEY);
+      if (stored) {
+        setDaySnapshots(JSON.parse(stored));
+      }
+      setDaySnapshotsLoaded(true);
+    }
+    loadDaySnapshots();
+  }, []);
+
+  useEffect(() => {
+    if (daySnapshotsLoaded) {
+      AsyncStorage.setItem(DAY_SNAPSHOTS_KEY, JSON.stringify(daySnapshots));
+    }
+  }, [daySnapshots]);
+
+  // Takes the snapshot for selectedDate the first time it's encountered,
+  // then never again — this is the "set once per day" rule. Checking
+  // habits off after the snapshot exists has no effect on it; it can only
+  // shape the snapshot for a date that hasn't been taken yet (e.g.
+  // tomorrow, once tomorrow arrives and gets its own first-visit snapshot).
+  useEffect(() => {
+    if (!loaded || !daySnapshotsLoaded) return;
+    if (daySnapshots[selectedDate]) return;
+
+    const snapshot = computeDaySnapshot(habits, selectedDate);
+    setDaySnapshots(prev => ({ ...prev, [selectedDate]: snapshot }));
+  }, [loaded, daySnapshotsLoaded, selectedDate, habits, daySnapshots]);
 
   function goToPreviousDay() {
     const d = new Date(selectedDate);
@@ -449,6 +490,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     ));
   }
 
+  // Swaps order values with the neighboring habit within the same time-of-day group.
   function moveHabit(id: string, direction: 'up' | 'down') {
     const target = habits.find(h => h.id === id);
     if (!target) return;
@@ -478,71 +520,209 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return calculatePeriodInfo(habit, selectedDate);
   }
 
-  function getHabitMomentumSeries(habit: Habit): MomentumPoint[] {
-    return calculateMomentumSeries(habit, today, MOMENTUM_WINDOW_DAYS);
+  function getCategoryColor(category: string): string {
+    if (!category || category === DEFAULT_CATEGORY) return '#F2F2F2';
+    const order = getCategoryCreationOrder(habits);
+    const index = order.indexOf(category);
+    const safeIndex = index === -1 ? order.length : index;
+    return CATEGORY_PALETTE[safeIndex % CATEGORY_PALETTE.length];
   }
 
-  function getLongestStreak(habit: Habit): number {
-    return calculateLongestStreak(habit.completions);
+  function getCategoryAccentColor(category: string): string {
+    if (!category || category === DEFAULT_CATEGORY) return '#A8A29E';
+    const order = getCategoryCreationOrder(habits);
+    const index = order.indexOf(category);
+    const safeIndex = index === -1 ? order.length : index;
+    return CATEGORY_ACCENT_PALETTE[safeIndex % CATEGORY_ACCENT_PALETTE.length];
   }
 
-  function getHabitHistorySquares(habit: Habit): HistorySquare[] {
-    return buildHistorySquares(habit, today);
-  }
-
-  function getPeriodStreak(habit: Habit): number {
-    return calculatePeriodStreak(habit, today);
-  }
-
-  function getCompletionRate(habit: Habit): CompletionRate {
-    return calculateCompletionRate(habit, today);
-  }
-
+  // Today's momentum score per category (average of that category's habits).
   function getCategoryScores(): CategoryScore[] {
-    const categories = Array.from(new Set(habits.map(h => h.category)));
-    return categories.map(category => {
-      const habitsInCategory = habits.filter(h => h.category === category);
-      const latestScores = habitsInCategory.map(h => {
-        const series = calculateMomentumSeries(h, today, MOMENTUM_WINDOW_DAYS);
-        return series[series.length - 1]?.score ?? MOMENTUM_BASELINE;
-      });
-      const avg = latestScores.length > 0
-        ? latestScores.reduce((sum, s) => sum + s, 0) / latestScores.length
-        : MOMENTUM_BASELINE;
+    const order = getCategoryCreationOrder(habits);
+    return order.map(category => {
+      const inCategory = habits.filter(h => h.category === category);
+      if (inCategory.length === 0) return { category, score: 0 };
+      const avg = inCategory.reduce((sum, h) => sum + calculateMomentum(h, today), 0) / inCategory.length;
       return { category, score: Math.round(avg) };
     });
   }
 
+  // Last 90 days of category momentum, for the trend line chart.
   function getCategoryScoreHistory(): CategoryScoreHistoryPoint[] {
-    const categories = Array.from(new Set(habits.map(h => h.category)));
+    const TREND_DAYS = 90;
+    const categories = getCategoryCreationOrder(habits);
+    const points: CategoryScoreHistoryPoint[] = [];
 
-    const habitSeries = habits.map(h => ({
-      category: h.category,
-      series: calculateMomentumSeries(h, today, MOMENTUM_WINDOW_DAYS),
-    }));
+    const cursor = new Date(today);
+    cursor.setDate(cursor.getDate() - (TREND_DAYS - 1));
 
-    const history: CategoryScoreHistoryPoint[] = [];
-
-    for (let i = 0; i < MOMENTUM_WINDOW_DAYS; i++) {
-      const fallbackDate = new Date(today);
-      fallbackDate.setDate(fallbackDate.getDate() - (MOMENTUM_WINDOW_DAYS - 1 - i));
-      const date = habitSeries[0]?.series[i]?.date ?? dateToString(fallbackDate);
-
+    for (let i = 0; i < TREND_DAYS; i++) {
+      const ds = dateToString(cursor);
       const scores: Record<string, number> = {};
+
       categories.forEach(category => {
-        const pointsForCategory = habitSeries
-          .filter(hs => hs.category === category)
-          .map(hs => hs.series[i]?.score ?? MOMENTUM_BASELINE);
-        const avg = pointsForCategory.length > 0
-          ? pointsForCategory.reduce((sum, s) => sum + s, 0) / pointsForCategory.length
-          : MOMENTUM_BASELINE;
+        const inCategory = habits.filter(h => h.category === category);
+        const avg = inCategory.length > 0
+          ? inCategory.reduce((sum, h) => sum + calculateMomentum(h, ds), 0) / inCategory.length
+          : 0;
         scores[category] = Math.round(avg);
       });
 
-      history.push({ date, scores });
+      points.push({ date: ds, scores });
+      cursor.setDate(cursor.getDate() + 1);
     }
 
-    return history;
+    return points;
+  }
+
+  // Longest consecutive-day streak this habit has ever had, across its whole history.
+  function getLongestStreak(habit: Habit): number {
+    const doneDates = Object.keys(habit.completions)
+      .filter(d => habit.completions[d] === true)
+      .sort();
+
+    if (doneDates.length === 0) return 0;
+
+    let longest = 1;
+    let current = 1;
+    for (let i = 1; i < doneDates.length; i++) {
+      const prev = new Date(doneDates[i - 1]);
+      const curr = new Date(doneDates[i]);
+      const diffDays = Math.round((curr.getTime() - prev.getTime()) / 86400000);
+      current = diffDays === 1 ? current + 1 : 1;
+      longest = Math.max(longest, current);
+    }
+    return longest;
+  }
+
+  // Full done/not-done history for the heatmap, from the earliest completion
+  // (or 90 days back if there's no history yet) through today.
+  function getHabitHistorySquares(habit: Habit): HistorySquare[] {
+    const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true).sort();
+
+    let startDateStr: string;
+    if (doneDates.length > 0) {
+      startDateStr = doneDates[0];
+    } else {
+      const d = new Date(today);
+      d.setDate(d.getDate() - 90);
+      startDateStr = dateToString(d);
+    }
+
+    const squares: HistorySquare[] = [];
+    const cursor = new Date(startDateStr);
+    const end = new Date(today);
+    while (cursor <= end) {
+      const ds = dateToString(cursor);
+      squares.push({ date: ds, done: habit.completions[ds] === true });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return squares;
+  }
+
+  // Consecutive periods (in the habit's own unit — day/week/month) that
+  // fully met the target, counting backward from the current one.
+  function getPeriodStreak(habit: Habit): number {
+    if (habit.targetPeriod === 'day') {
+      return calculateStreak(habit.completions, today);
+    }
+
+    let streak = 0;
+
+    const currentInfo = calculatePeriodInfo(habit, today);
+    if (currentInfo.completedCount >= habit.targetCount) {
+      streak++;
+    }
+
+    let anchor = stepToPreviousPeriod(today, habit.targetPeriod);
+    let safety = 0;
+    while (safety < 1000) {
+      safety++;
+      const completed = countFullPeriodCompletions(habit, anchor);
+      if (completed < habit.targetCount) break;
+      streak++;
+      anchor = stepToPreviousPeriod(anchor, habit.targetPeriod);
+    }
+
+    return streak;
+  }
+
+  // Overall completion rate across every fully-elapsed period since the
+  // habit's first completion (the current, still-in-progress period is
+  // excluded so it can't unfairly count as a miss).
+  function getCompletionRate(habit: Habit): CompletionRate {
+    const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true).sort();
+    if (doneDates.length === 0) {
+      return { met: 0, total: 0, rate: 0 };
+    }
+
+    const currentPeriodStart = getPeriodBounds(today, habit.targetPeriod).start;
+
+    let anchor = doneDates[0];
+    let met = 0;
+    let total = 0;
+    let safety = 0;
+
+    while (safety < 2000) {
+      safety++;
+      const { start, end } = getPeriodBounds(anchor, habit.targetPeriod);
+      if (start >= currentPeriodStart) break;
+
+      const completed = countFullPeriodCompletions(habit, anchor);
+      total++;
+      if (completed >= habit.targetCount) met++;
+
+      const next = new Date(end);
+      next.setDate(next.getDate() + 1);
+      anchor = dateToString(next);
+    }
+
+    const rate = total > 0 ? Math.round((met / total) * 100) : 0;
+    return { met, total, rate };
+  }
+
+  function setViewMode(mode: ViewMode) {
+    setViewModeState(mode);
+  }
+
+  function setHideCompleted(hide: boolean) {
+    setHideCompletedState(hide);
+  }
+
+  // Sorts a group of habits (already filtered to one timeOfDay) according
+  // to the current view mode. Static = manual `order`. Dynamic = the
+  // frozen per-day neglect ranking from daySnapshots, falling back to
+  // manual `order` for any habit not present in the snapshot (e.g. one
+  // added after the snapshot was taken today) and for the brief moment
+  // before today's first snapshot has been computed.
+  function getOrderedHabits(habitsInGroup: Habit[]): Habit[] {
+    if (viewMode === 'static') {
+      return [...habitsInGroup].sort((a, b) => a.order - b.order);
+    }
+
+    const snapshot = daySnapshots[selectedDate];
+    if (!snapshot) {
+      return [...habitsInGroup].sort((a, b) => a.order - b.order);
+    }
+
+    const rank = new Map(snapshot.orderedIds.map((id, index) => [id, index]));
+    return [...habitsInGroup].sort((a, b) => {
+      const rankA = rank.has(a.id) ? rank.get(a.id)! : Number.MAX_SAFE_INTEGER;
+      const rankB = rank.has(b.id) ? rank.get(b.id)! : Number.MAX_SAFE_INTEGER;
+      if (rankA !== rankB) return rankA - rankB;
+      return a.order - b.order;
+    });
+  }
+
+  // Whether a habit should currently be visible, given the hide-completed
+  // setting. Uses the same frozen per-day snapshot as ordering: a habit
+  // only counts as "was completed" for hiding purposes if it was already
+  // done at snapshot time, so checking it off today never hides it today.
+  function shouldShowHabit(habit: Habit): boolean {
+    if (!hideCompleted) return true;
+    const snapshot = daySnapshots[selectedDate];
+    if (!snapshot) return true;
+    return !snapshot.completedAtSnapshot.includes(habit.id);
   }
 
   return (
@@ -563,13 +743,20 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         moveHabit,
         getStreak,
         getPeriodInfo,
-        getHabitMomentumSeries,
+        getCategoryColor,
+        getCategoryAccentColor,
         getCategoryScores,
         getCategoryScoreHistory,
         getLongestStreak,
         getHabitHistorySquares,
         getPeriodStreak,
         getCompletionRate,
+        viewMode,
+        setViewMode,
+        getOrderedHabits,
+        hideCompleted,
+        setHideCompleted,
+        shouldShowHabit,
       }}
     >
       {children}
