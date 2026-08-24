@@ -174,87 +174,26 @@ function TrendLineChart({
   );
 }
 
-// Same padding/grid conventions as TrendLineChart, but a single line
-// instead of one-per-category, and a y-axis that auto-scales to the data
-// (points totals aren't bounded to 0-100 like momentum scores are).
-function ScoreTrendChart({ history, width, height }: { history: DayScore[]; width: number; height: number }) {
-  const paddingLeft = 32;
-  const paddingRight = 12;
-  const paddingTop = 12;
-  const paddingBottom = 24;
+type ChartLine = { key: string; color: string; values: number[] };
 
-  const chartWidth = width - paddingLeft - paddingRight;
-  const chartHeight = height - paddingTop - paddingBottom;
-
-  if (history.length === 0) {
-    return null;
-  }
-
-  // Floor of 50 keeps the chart from looking broken when everything's still
-  // at 0 (e.g. right after adding the feature), rounded up to a clean
-  // multiple of 25 so the gridlines land on tidy numbers.
-  const maxObserved = Math.max(50, ...history.map(h => h.totalPoints));
-  const roundedMax = Math.ceil(maxObserved / 25) * 25;
-
-  function xFor(index: number): number {
-    return paddingLeft + (index / (history.length - 1)) * chartWidth;
-  }
-
-  function yFor(value: number): number {
-    const clamped = Math.max(0, Math.min(roundedMax, value));
-    return paddingTop + (1 - clamped / roundedMax) * chartHeight;
-  }
-
-  const gridLevels = [0, roundedMax / 4, roundedMax / 2, (roundedMax * 3) / 4, roundedMax];
-
-  const points = history.map((h, i) => `${xFor(i)},${yFor(h.totalPoints)}`).join(' ');
-
-  return (
-    <Svg width={width} height={height}>
-      {gridLevels.map(level => (
-        <Line
-          key={level}
-          x1={paddingLeft}
-          y1={yFor(level)}
-          x2={width - paddingRight}
-          y2={yFor(level)}
-          stroke="#eee"
-          strokeWidth={1}
-        />
-      ))}
-      {gridLevels.map(level => (
-        <SvgText key={level} x={4} y={yFor(level) + 4} fontSize={10} fill="#999">
-          {Math.round(level)}
-        </SvgText>
-      ))}
-
-      <Polyline points={points} fill="none" stroke={SCORE_ACCENT} strokeWidth={3} />
-
-      <SvgText x={paddingLeft} y={height - 4} fontSize={10} fill="#999">
-        {formatShortDate(history[0].date)}
-      </SvgText>
-      <SvgText x={width - paddingRight - 44} y={height - 4} fontSize={10} fill="#999">
-        {formatShortDate(history[history.length - 1].date)}
-      </SvgText>
-    </Svg>
-  );
-}
-
-// Same "history + which categories to draw" pattern as TrendLineChart, but
-// for points: auto-scaled y-axis instead of a fixed 0-100 range, since
-// point totals aren't bounded the way momentum scores are.
-function CategoryScoreTrendChart({
-  history,
-  categories,
+// Draws any combination of lines on a shared, auto-scaled axis — used for
+// both the combined total and per-category series, since they're really
+// the same kind of data (a daily points number) just filtered differently.
+// Replaces the two separate chart components that used to exist for
+// "combined" vs "per-category" — now that both can be shown together,
+// duplicating the axis/scaling logic across two components stopped
+// making sense.
+function PointsTrendChart({
+  dates,
+  lines,
   width,
   height,
 }: {
-  history: CategoryScoreHistoryPoint[];
-  categories: string[];
+  dates: string[];
+  lines: ChartLine[];
   width: number;
   height: number;
 }) {
-  const { getCategoryAccentColor } = useHabits();
   const paddingLeft = 32;
   const paddingRight = 12;
   const paddingTop = 12;
@@ -263,18 +202,15 @@ function CategoryScoreTrendChart({
   const chartWidth = width - paddingLeft - paddingRight;
   const chartHeight = height - paddingTop - paddingBottom;
 
-  if (history.length === 0 || categories.length === 0) {
+  if (dates.length === 0 || lines.length === 0) {
     return null;
   }
 
-  const maxObserved = Math.max(
-    50,
-    ...history.flatMap(point => categories.map(c => point.scores[c] ?? 0))
-  );
+  const maxObserved = Math.max(50, ...lines.flatMap(l => l.values));
   const roundedMax = Math.ceil(maxObserved / 25) * 25;
 
   function xFor(index: number): number {
-    return paddingLeft + (index / (history.length - 1)) * chartWidth;
+    return paddingLeft + (index / (dates.length - 1)) * chartWidth;
   }
 
   function yFor(value: number): number {
@@ -303,26 +239,16 @@ function CategoryScoreTrendChart({
         </SvgText>
       ))}
 
-      {categories.map(category => {
-        const points = history
-          .map((point, i) => `${xFor(i)},${yFor(point.scores[category] ?? 0)}`)
-          .join(' ');
-        return (
-          <Polyline
-            key={category}
-            points={points}
-            fill="none"
-            stroke={getCategoryAccentColor(category)}
-            strokeWidth={3}
-          />
-        );
+      {lines.map(line => {
+        const points = line.values.map((v, i) => `${xFor(i)},${yFor(v)}`).join(' ');
+        return <Polyline key={line.key} points={points} fill="none" stroke={line.color} strokeWidth={3} />;
       })}
 
       <SvgText x={paddingLeft} y={height - 4} fontSize={10} fill="#999">
-        {formatShortDate(history[0].date)}
+        {formatShortDate(dates[0])}
       </SvgText>
       <SvgText x={width - paddingRight - 44} y={height - 4} fontSize={10} fill="#999">
-        {formatShortDate(history[history.length - 1].date)}
+        {formatShortDate(dates[dates.length - 1])}
       </SvgText>
     </Svg>
   );
@@ -398,28 +324,17 @@ export default function InsightsScreen() {
   } = useHabits();
   const { width } = useWindowDimensions();
 
-  // "All" is the default view (combined total, amber line). Selecting a
-  // category switches to per-category mode: one or more colour-coded lines,
-  // and the Today/This week cards scoped to just those categories. Clearing
-  // the last selected category falls back to "All" rather than leaving the
-  // chart empty.
-  const [showAll, setShowAll] = useState(true);
-  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  // Every chip — "All" and each category — toggles independently, so any
+  // combination can be shown together (e.g. the combined total alongside
+  // one category, for direct comparison). The only rule: at least one
+  // series must stay selected, so clearing the last one falls back to All
+  // rather than leaving the chart empty.
+  const [selectedSeries, setSelectedSeries] = useState<string[]>(['All']);
 
-  function toggleCategory(category: string) {
-    if (showAll) {
-      setShowAll(false);
-      setSelectedCategories([category]);
-      return;
-    }
-    setSelectedCategories(prev => {
-      const next = prev.includes(category)
-        ? prev.filter(c => c !== category)
-        : [...prev, category];
-      if (next.length === 0) {
-        setShowAll(true);
-      }
-      return next;
+  function toggleSeries(key: string) {
+    setSelectedSeries(prev => {
+      const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+      return next.length === 0 ? ['All'] : next;
     });
   }
 
@@ -428,11 +343,32 @@ export default function InsightsScreen() {
   const categoryScores = getCategoryScores();
   const categories = categoryScores.map(c => c.category);
   const history = getCategoryScoreHistory();
-  const activeCategories = showAll ? undefined : selectedCategories;
-  const todayScore = getDayScore(today, activeCategories);
-  const weekScore = getWeekScore(activeCategories);
+
+  const includesAll = selectedSeries.includes('All');
+  const selectedCategoryNames = selectedSeries.filter(s => s !== 'All');
+  // If "All" is among the selected chips, the cards show the true
+  // unfiltered total (it's a superset of anything else selected anyway).
+  // Otherwise they're scoped to just the chosen categories.
+  const cardCategoriesFilter = includesAll ? undefined : selectedCategoryNames;
+  const todayScore = getDayScore(today, cardCategoriesFilter);
+  const weekScore = getWeekScore(cardCategoriesFilter);
+
   const scoreHistory = getScoreHistory();
   const categoryPointsHistory = getPointsHistoryByCategory();
+  const scoreDates = scoreHistory.map(s => s.date);
+  const chartLines: ChartLine[] = [
+    ...(includesAll
+      ? [{ key: 'All', color: SCORE_ACCENT, values: scoreHistory.map(s => s.totalPoints) }]
+      : []),
+    ...categories
+      .filter(category => selectedSeries.includes(category))
+      .map(category => ({
+        key: category,
+        color: getCategoryAccentColor(category),
+        values: categoryPointsHistory.map(p => p.scores[category] ?? 0),
+      })),
+  ];
+
   const chartSize = Math.min(width - 32, 340);
   const trendWidth = width - 32;
 
@@ -451,19 +387,19 @@ export default function InsightsScreen() {
 
             <View style={styles.categoryToggleRow}>
               <Pressable
-                onPress={() => { setShowAll(true); setSelectedCategories([]); }}
-                style={[styles.categoryChip, showAll && styles.categoryChipActiveAll]}
+                onPress={() => toggleSeries('All')}
+                style={[styles.categoryChip, includesAll && styles.categoryChipActiveAll]}
               >
-                <Text style={[styles.categoryChipText, showAll && styles.categoryChipTextActive]}>
+                <Text style={[styles.categoryChipText, includesAll && styles.categoryChipTextActive]}>
                   All
                 </Text>
               </Pressable>
               {categories.map(category => {
-                const active = !showAll && selectedCategories.includes(category);
+                const active = selectedSeries.includes(category);
                 return (
                   <Pressable
                     key={category}
-                    onPress={() => toggleCategory(category)}
+                    onPress={() => toggleSeries(category)}
                     style={[
                       styles.categoryChip,
                       active && { backgroundColor: getCategoryAccentColor(category) },
@@ -480,7 +416,7 @@ export default function InsightsScreen() {
             <View style={styles.scoreCardsRow}>
               <View style={styles.scoreCard}>
                 <Text style={styles.scoreCardLabel}>
-                  Today{!showAll ? ` · ${selectedCategories.join(', ')}` : ''}
+                  Today{!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}
                 </Text>
                 <Text style={styles.scoreCardValue}>{todayScore.totalPoints}</Text>
                 {todayScore.bonusPoints > 0 && (
@@ -489,23 +425,14 @@ export default function InsightsScreen() {
               </View>
               <View style={styles.scoreCard}>
                 <Text style={styles.scoreCardLabel}>
-                  This week{!showAll ? ` · ${selectedCategories.join(', ')}` : ''}
+                  This week{!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}
                 </Text>
                 <Text style={styles.scoreCardValue}>{weekScore}</Text>
               </View>
             </View>
 
             <View style={styles.chartWrap}>
-              {showAll ? (
-                <ScoreTrendChart history={scoreHistory} width={trendWidth} height={160} />
-              ) : (
-                <CategoryScoreTrendChart
-                  history={categoryPointsHistory}
-                  categories={selectedCategories}
-                  width={trendWidth}
-                  height={160}
-                />
-              )}
+              <PointsTrendChart dates={scoreDates} lines={chartLines} width={trendWidth} height={160} />
             </View>
 
             <Text style={[styles.subheader, { marginTop: 24 }]}>Category momentum (today)</Text>
