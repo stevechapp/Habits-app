@@ -1,4 +1,5 @@
-import { StyleSheet, Text, SafeAreaView, View, ScrollView, useWindowDimensions } from 'react-native';
+import { useState } from 'react';
+import { StyleSheet, Text, SafeAreaView, View, ScrollView, Pressable, useWindowDimensions } from 'react-native';
 import Svg, { Polygon, Polyline, Line, Circle, Text as SvgText } from 'react-native-svg';
 import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate, DayScore } from '../HabitsContext';
 
@@ -239,6 +240,94 @@ function ScoreTrendChart({ history, width, height }: { history: DayScore[]; widt
   );
 }
 
+// Same "history + which categories to draw" pattern as TrendLineChart, but
+// for points: auto-scaled y-axis instead of a fixed 0-100 range, since
+// point totals aren't bounded the way momentum scores are.
+function CategoryScoreTrendChart({
+  history,
+  categories,
+  width,
+  height,
+}: {
+  history: CategoryScoreHistoryPoint[];
+  categories: string[];
+  width: number;
+  height: number;
+}) {
+  const { getCategoryAccentColor } = useHabits();
+  const paddingLeft = 32;
+  const paddingRight = 12;
+  const paddingTop = 12;
+  const paddingBottom = 24;
+
+  const chartWidth = width - paddingLeft - paddingRight;
+  const chartHeight = height - paddingTop - paddingBottom;
+
+  if (history.length === 0 || categories.length === 0) {
+    return null;
+  }
+
+  const maxObserved = Math.max(
+    50,
+    ...history.flatMap(point => categories.map(c => point.scores[c] ?? 0))
+  );
+  const roundedMax = Math.ceil(maxObserved / 25) * 25;
+
+  function xFor(index: number): number {
+    return paddingLeft + (index / (history.length - 1)) * chartWidth;
+  }
+
+  function yFor(value: number): number {
+    const clamped = Math.max(0, Math.min(roundedMax, value));
+    return paddingTop + (1 - clamped / roundedMax) * chartHeight;
+  }
+
+  const gridLevels = [0, roundedMax / 4, roundedMax / 2, (roundedMax * 3) / 4, roundedMax];
+
+  return (
+    <Svg width={width} height={height}>
+      {gridLevels.map(level => (
+        <Line
+          key={level}
+          x1={paddingLeft}
+          y1={yFor(level)}
+          x2={width - paddingRight}
+          y2={yFor(level)}
+          stroke="#eee"
+          strokeWidth={1}
+        />
+      ))}
+      {gridLevels.map(level => (
+        <SvgText key={level} x={4} y={yFor(level) + 4} fontSize={10} fill="#999">
+          {Math.round(level)}
+        </SvgText>
+      ))}
+
+      {categories.map(category => {
+        const points = history
+          .map((point, i) => `${xFor(i)},${yFor(point.scores[category] ?? 0)}`)
+          .join(' ');
+        return (
+          <Polyline
+            key={category}
+            points={points}
+            fill="none"
+            stroke={getCategoryAccentColor(category)}
+            strokeWidth={3}
+          />
+        );
+      })}
+
+      <SvgText x={paddingLeft} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[0].date)}
+      </SvgText>
+      <SvgText x={width - paddingRight - 44} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[history.length - 1].date)}
+      </SvgText>
+    </Svg>
+  );
+}
+
 function buildWeekColumns(squares: HistorySquare[]): (HistorySquare | null)[][] {
   if (squares.length === 0) return [];
 
@@ -304,18 +393,46 @@ export default function InsightsScreen() {
   const {
     habits, loaded, today, getCategoryScores, getCategoryScoreHistory,
     getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
-    getCategoryColor, getCategoryAccentColor, getDayScore, getWeekScore, getScoreHistory,
+    getCategoryColor, getCategoryAccentColor, getDayScore, getWeekScore,
+    getScoreHistory, getPointsHistoryByCategory,
   } = useHabits();
   const { width } = useWindowDimensions();
+
+  // "All" is the default view (combined total, amber line). Selecting a
+  // category switches to per-category mode: one or more colour-coded lines,
+  // and the Today/This week cards scoped to just those categories. Clearing
+  // the last selected category falls back to "All" rather than leaving the
+  // chart empty.
+  const [showAll, setShowAll] = useState(true);
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+
+  function toggleCategory(category: string) {
+    if (showAll) {
+      setShowAll(false);
+      setSelectedCategories([category]);
+      return;
+    }
+    setSelectedCategories(prev => {
+      const next = prev.includes(category)
+        ? prev.filter(c => c !== category)
+        : [...prev, category];
+      if (next.length === 0) {
+        setShowAll(true);
+      }
+      return next;
+    });
+  }
 
   if (!loaded) return null;
 
   const categoryScores = getCategoryScores();
   const categories = categoryScores.map(c => c.category);
   const history = getCategoryScoreHistory();
-  const todayScore = getDayScore(today);
-  const weekScore = getWeekScore();
+  const activeCategories = showAll ? undefined : selectedCategories;
+  const todayScore = getDayScore(today, activeCategories);
+  const weekScore = getWeekScore(activeCategories);
   const scoreHistory = getScoreHistory();
+  const categoryPointsHistory = getPointsHistoryByCategory();
   const chartSize = Math.min(width - 32, 340);
   const trendWidth = width - 32;
 
@@ -331,21 +448,64 @@ export default function InsightsScreen() {
         {categoryScores.length > 0 && (
           <>
             <Text style={styles.subheader}>Score</Text>
+
+            <View style={styles.categoryToggleRow}>
+              <Pressable
+                onPress={() => { setShowAll(true); setSelectedCategories([]); }}
+                style={[styles.categoryChip, showAll && styles.categoryChipActiveAll]}
+              >
+                <Text style={[styles.categoryChipText, showAll && styles.categoryChipTextActive]}>
+                  All
+                </Text>
+              </Pressable>
+              {categories.map(category => {
+                const active = !showAll && selectedCategories.includes(category);
+                return (
+                  <Pressable
+                    key={category}
+                    onPress={() => toggleCategory(category)}
+                    style={[
+                      styles.categoryChip,
+                      active && { backgroundColor: getCategoryAccentColor(category) },
+                    ]}
+                  >
+                    <Text style={[styles.categoryChipText, active && styles.categoryChipTextActive]}>
+                      {category}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
             <View style={styles.scoreCardsRow}>
               <View style={styles.scoreCard}>
-                <Text style={styles.scoreCardLabel}>Today</Text>
+                <Text style={styles.scoreCardLabel}>
+                  Today{!showAll ? ` · ${selectedCategories.join(', ')}` : ''}
+                </Text>
                 <Text style={styles.scoreCardValue}>{todayScore.totalPoints}</Text>
                 {todayScore.bonusPoints > 0 && (
                   <Text style={styles.scoreCardBonus}>+{todayScore.bonusPoints} bonus</Text>
                 )}
               </View>
               <View style={styles.scoreCard}>
-                <Text style={styles.scoreCardLabel}>This week</Text>
+                <Text style={styles.scoreCardLabel}>
+                  This week{!showAll ? ` · ${selectedCategories.join(', ')}` : ''}
+                </Text>
                 <Text style={styles.scoreCardValue}>{weekScore}</Text>
               </View>
             </View>
+
             <View style={styles.chartWrap}>
-              <ScoreTrendChart history={scoreHistory} width={trendWidth} height={160} />
+              {showAll ? (
+                <ScoreTrendChart history={scoreHistory} width={trendWidth} height={160} />
+              ) : (
+                <CategoryScoreTrendChart
+                  history={categoryPointsHistory}
+                  categories={selectedCategories}
+                  width={trendWidth}
+                  height={160}
+                />
+              )}
             </View>
 
             <Text style={[styles.subheader, { marginTop: 24 }]}>Category momentum (today)</Text>
@@ -445,6 +605,16 @@ const styles = StyleSheet.create({
   categoryName: { fontSize: 17, fontWeight: '600' },
   score: { fontSize: 20, fontWeight: '700', color: '#333' },
   scoreCardsRow: { flexDirection: 'row', gap: 10, marginBottom: 4 },
+  categoryToggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
+  categoryChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    backgroundColor: '#F2F2F2',
+  },
+  categoryChipActiveAll: { backgroundColor: SCORE_ACCENT },
+  categoryChipText: { fontSize: 13, fontWeight: '600', color: '#666' },
+  categoryChipTextActive: { color: '#fff' },
   scoreCard: {
     flex: 1,
     backgroundColor: '#FFFBEB',

@@ -84,9 +84,10 @@ type HabitsContextType = {
   getPeriodStreak: (habit: Habit) => number;
   getCompletionRate: (habit: Habit) => CompletionRate;
   // Points / scoring
-  getDayScore: (dateStr: string) => DayScore;
-  getWeekScore: () => number;
+  getDayScore: (dateStr: string, categories?: string[]) => DayScore;
+  getWeekScore: (categories?: string[]) => number;
   getScoreHistory: (days?: number) => DayScore[];
+  getPointsHistoryByCategory: (days?: number) => CategoryScoreHistoryPoint[];
   // View mode / neglect-sorting
   viewMode: ViewMode;
   setViewMode: (mode: ViewMode) => void;
@@ -715,21 +716,24 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return calculatePeriodStreakAsOf(habit, today);
   }
 
-  function getDayScore(dateStr: string): DayScore {
-    return calculateDayScore(habits, dateStr);
+  function getDayScore(dateStr: string, categories?: string[]): DayScore {
+    const scoped = categories ? habits.filter(h => categories.includes(h.category)) : habits;
+    return calculateDayScore(scoped, dateStr);
   }
 
   // Sum of daily totals from this calendar week's Monday through today —
   // same "calendar-aligned week" definition used everywhere else (period
   // status, momentum), so it lines up with what the rest of the app means
-  // by "this week."
-  function getWeekScore(): number {
+  // by "this week." Optional categories filter scopes it to a subset of
+  // habits, same convention as getDayScore.
+  function getWeekScore(categories?: string[]): number {
+    const scoped = categories ? habits.filter(h => categories.includes(h.category)) : habits;
     const { start } = getPeriodBounds(today, 'week');
     let total = 0;
     const cursor = new Date(start);
     const end = new Date(today);
     while (cursor <= end) {
-      total += calculateDayScore(habits, dateToString(cursor)).totalPoints;
+      total += calculateDayScore(scoped, dateToString(cursor)).totalPoints;
       cursor.setDate(cursor.getDate() + 1);
     }
     return total;
@@ -746,6 +750,35 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
       points.push(calculateDayScore(habits, ds));
       cursor.setDate(cursor.getDate() + 1);
     }
+    return points;
+  }
+
+  // Per-category daily point totals, same shape as getCategoryScoreHistory
+  // (CategoryScoreHistoryPoint), so the same "history + a list of which
+  // categories to draw" chart pattern works for points as for momentum.
+  // Each category's total for a day is just that category's habits run
+  // through the same calculateDayScore used everywhere else — bonuses are
+  // already per-habit, so filtering the habit list first is all this needs.
+  function getPointsHistoryByCategory(days: number = 90): CategoryScoreHistoryPoint[] {
+    const categories = getCategoryCreationOrder(habits);
+    const points: CategoryScoreHistoryPoint[] = [];
+
+    const cursor = new Date(today);
+    cursor.setDate(cursor.getDate() - (days - 1));
+
+    for (let i = 0; i < days; i++) {
+      const ds = dateToString(cursor);
+      const scores: Record<string, number> = {};
+
+      categories.forEach(category => {
+        const inCategory = habits.filter(h => h.category === category);
+        scores[category] = calculateDayScore(inCategory, ds).totalPoints;
+      });
+
+      points.push({ date: ds, scores });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
     return points;
   }
 
@@ -856,6 +889,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getDayScore,
         getWeekScore,
         getScoreHistory,
+        getPointsHistoryByCategory,
         viewMode,
         setViewMode,
         getOrderedHabits,
