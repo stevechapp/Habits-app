@@ -1,9 +1,10 @@
 import { StyleSheet, Text, SafeAreaView, View, ScrollView, useWindowDimensions } from 'react-native';
 import Svg, { Polygon, Polyline, Line, Circle, Text as SvgText } from 'react-native-svg';
-import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate } from '../HabitsContext';
+import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate, DayScore } from '../HabitsContext';
 
 const GRID_LEVELS = [0.25, 0.5, 0.75, 1.0];
 const CHART_ACCENT = '#7c3aed';
+const SCORE_ACCENT = '#D97706';
 
 function polarPoint(cx: number, cy: number, radius: number, angleDeg: number) {
   const angleRad = ((angleDeg - 90) * Math.PI) / 180;
@@ -172,6 +173,72 @@ function TrendLineChart({
   );
 }
 
+// Same padding/grid conventions as TrendLineChart, but a single line
+// instead of one-per-category, and a y-axis that auto-scales to the data
+// (points totals aren't bounded to 0-100 like momentum scores are).
+function ScoreTrendChart({ history, width, height }: { history: DayScore[]; width: number; height: number }) {
+  const paddingLeft = 32;
+  const paddingRight = 12;
+  const paddingTop = 12;
+  const paddingBottom = 24;
+
+  const chartWidth = width - paddingLeft - paddingRight;
+  const chartHeight = height - paddingTop - paddingBottom;
+
+  if (history.length === 0) {
+    return null;
+  }
+
+  // Floor of 50 keeps the chart from looking broken when everything's still
+  // at 0 (e.g. right after adding the feature), rounded up to a clean
+  // multiple of 25 so the gridlines land on tidy numbers.
+  const maxObserved = Math.max(50, ...history.map(h => h.totalPoints));
+  const roundedMax = Math.ceil(maxObserved / 25) * 25;
+
+  function xFor(index: number): number {
+    return paddingLeft + (index / (history.length - 1)) * chartWidth;
+  }
+
+  function yFor(value: number): number {
+    const clamped = Math.max(0, Math.min(roundedMax, value));
+    return paddingTop + (1 - clamped / roundedMax) * chartHeight;
+  }
+
+  const gridLevels = [0, roundedMax / 4, roundedMax / 2, (roundedMax * 3) / 4, roundedMax];
+
+  const points = history.map((h, i) => `${xFor(i)},${yFor(h.totalPoints)}`).join(' ');
+
+  return (
+    <Svg width={width} height={height}>
+      {gridLevels.map(level => (
+        <Line
+          key={level}
+          x1={paddingLeft}
+          y1={yFor(level)}
+          x2={width - paddingRight}
+          y2={yFor(level)}
+          stroke="#eee"
+          strokeWidth={1}
+        />
+      ))}
+      {gridLevels.map(level => (
+        <SvgText key={level} x={4} y={yFor(level) + 4} fontSize={10} fill="#999">
+          {Math.round(level)}
+        </SvgText>
+      ))}
+
+      <Polyline points={points} fill="none" stroke={SCORE_ACCENT} strokeWidth={3} />
+
+      <SvgText x={paddingLeft} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[0].date)}
+      </SvgText>
+      <SvgText x={width - paddingRight - 44} y={height - 4} fontSize={10} fill="#999">
+        {formatShortDate(history[history.length - 1].date)}
+      </SvgText>
+    </Svg>
+  );
+}
+
 function buildWeekColumns(squares: HistorySquare[]): (HistorySquare | null)[][] {
   if (squares.length === 0) return [];
 
@@ -235,9 +302,9 @@ function pluralize(count: number, noun: string): string {
 
 export default function InsightsScreen() {
   const {
-    habits, loaded, getCategoryScores, getCategoryScoreHistory,
+    habits, loaded, today, getCategoryScores, getCategoryScoreHistory,
     getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
-    getCategoryColor, getCategoryAccentColor,
+    getCategoryColor, getCategoryAccentColor, getDayScore, getWeekScore, getScoreHistory,
   } = useHabits();
   const { width } = useWindowDimensions();
 
@@ -246,6 +313,9 @@ export default function InsightsScreen() {
   const categoryScores = getCategoryScores();
   const categories = categoryScores.map(c => c.category);
   const history = getCategoryScoreHistory();
+  const todayScore = getDayScore(today);
+  const weekScore = getWeekScore();
+  const scoreHistory = getScoreHistory();
   const chartSize = Math.min(width - 32, 340);
   const trendWidth = width - 32;
 
@@ -260,7 +330,25 @@ export default function InsightsScreen() {
 
         {categoryScores.length > 0 && (
           <>
-            <Text style={styles.subheader}>Category momentum (today)</Text>
+            <Text style={styles.subheader}>Score</Text>
+            <View style={styles.scoreCardsRow}>
+              <View style={styles.scoreCard}>
+                <Text style={styles.scoreCardLabel}>Today</Text>
+                <Text style={styles.scoreCardValue}>{todayScore.totalPoints}</Text>
+                {todayScore.bonusPoints > 0 && (
+                  <Text style={styles.scoreCardBonus}>+{todayScore.bonusPoints} bonus</Text>
+                )}
+              </View>
+              <View style={styles.scoreCard}>
+                <Text style={styles.scoreCardLabel}>This week</Text>
+                <Text style={styles.scoreCardValue}>{weekScore}</Text>
+              </View>
+            </View>
+            <View style={styles.chartWrap}>
+              <ScoreTrendChart history={scoreHistory} width={trendWidth} height={160} />
+            </View>
+
+            <Text style={[styles.subheader, { marginTop: 24 }]}>Category momentum (today)</Text>
             <View style={styles.chartWrap}>
               <RadarChart data={categoryScores} size={chartSize} />
             </View>
@@ -356,6 +444,17 @@ const styles = StyleSheet.create({
   },
   categoryName: { fontSize: 17, fontWeight: '600' },
   score: { fontSize: 20, fontWeight: '700', color: '#333' },
+  scoreCardsRow: { flexDirection: 'row', gap: 10, marginBottom: 4 },
+  scoreCard: {
+    flex: 1,
+    backgroundColor: '#FFFBEB',
+    borderRadius: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+  },
+  scoreCardLabel: { fontSize: 12, color: '#92700C', fontWeight: '600', marginBottom: 4 },
+  scoreCardValue: { fontSize: 24, fontWeight: '700', color: '#92700C' },
+  scoreCardBonus: { fontSize: 11, color: '#B45309', fontWeight: '600', marginTop: 2 },
   legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 8 },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   legendSwatch: { width: 12, height: 12, borderRadius: 3 },

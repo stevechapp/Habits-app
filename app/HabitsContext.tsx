@@ -14,6 +14,7 @@ export type Habit = {
   targetCount: number;
   targetPeriod: Period;
   order: number;
+  pointValue: number;
   completions: Record<string, boolean>; // date string -> done
 };
 
@@ -29,6 +30,7 @@ export type CategoryScore = { category: string; score: number };
 export type CategoryScoreHistoryPoint = { date: string; scores: Record<string, number> };
 export type HistorySquare = { date: string; done: boolean };
 export type CompletionRate = { met: number; total: number; rate: number };
+export type DayScore = { date: string; basePoints: number; bonusPoints: number; totalPoints: number };
 
 type StoredData = {
   version: number;
@@ -65,7 +67,7 @@ type HabitsContextType = {
   goToToday: () => void;
   isViewingToday: boolean;
   toggleHabit: (id: string) => void;
-  addHabit: (name: string, category: string, timeOfDay: TimeOfDay, targetCount: number, targetPeriod: Period) => void;
+  addHabit: (name: string, category: string, timeOfDay: TimeOfDay, targetCount: number, targetPeriod: Period, pointValue?: number) => void;
   deleteHabit: (id: string) => void;
   editHabit: (id: string, updates: Partial<Omit<Habit, 'id' | 'completions' | 'order'>>) => void;
   moveHabit: (id: string, direction: 'up' | 'down') => void;
@@ -81,6 +83,10 @@ type HabitsContextType = {
   getHabitHistorySquares: (habit: Habit) => HistorySquare[];
   getPeriodStreak: (habit: Habit) => number;
   getCompletionRate: (habit: Habit) => CompletionRate;
+  // Points / scoring
+  getDayScore: (dateStr: string) => DayScore;
+  getWeekScore: () => number;
+  getScoreHistory: (days?: number) => DayScore[];
   // View mode / neglect-sorting
   viewMode: ViewMode;
   setViewMode: (mode: ViewMode) => void;
@@ -94,13 +100,16 @@ type HabitsContextType = {
 const STORAGE_KEY = 'habits';
 const SETTINGS_KEY = 'habitSettings';
 const DAY_SNAPSHOTS_KEY = 'habitDaySnapshots';
-const CURRENT_VERSION = 3;
+const CURRENT_VERSION = 4;
 const DEFAULT_CATEGORY = 'Uncategorized';
+const DEFAULT_POINT_VALUE = 10;
+const PERIOD_STREAK_BONUS = 15; // flat bonus every PERIOD_STREAK_THRESHOLD-th consecutive met period
+const PERIOD_STREAK_THRESHOLD = 3;
 
 const defaultHabits: Habit[] = [
-  { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
-  { id: '2', name: 'Drink water', category: 'Body', timeOfDay: 'afternoon', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
-  { id: '3', name: 'Read', category: 'Mind', timeOfDay: 'evening', targetCount: 1, targetPeriod: 'day', order: 0, completions: {} },
+  { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
+  { id: '2', name: 'Drink water', category: 'Body', timeOfDay: 'afternoon', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
+  { id: '3', name: 'Read', category: 'Mind', timeOfDay: 'evening', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
 ];
 
 const defaultSettings: StoredSettings = {
@@ -181,6 +190,7 @@ function migrateHabits(oldHabits: any[]): Habit[] {
     targetCount: h.targetCount ?? 1,
     targetPeriod: h.targetPeriod ?? 'day',
     order: h.order ?? index,
+    pointValue: h.pointValue ?? DEFAULT_POINT_VALUE,
     completions: h.completions ?? {},
   }));
 }
@@ -337,6 +347,84 @@ function stepToPreviousPeriod(dateStr: string, period: Period): string {
   return dateToString(prevPeriodAnchor);
 }
 
+// --- Points / scoring engine ---------------------------------------------
+// Points are computed live from existing completions/period data, the same
+// way momentum and streaks are — nothing new is stored per day, so past
+// days' scores never need a snapshot and can't go stale.
+
+// Same "consecutive periods fully met, counting backward from asOfDateStr"
+// logic as getPeriodStreak below, but parameterized on an arbitrary date
+// instead of always anchoring on `today`, since bonus points need to be
+// evaluated as of whatever date a period closed on (which is often in the
+// past by the time you look at it).
+function calculatePeriodStreakAsOf(habit: Habit, asOfDateStr: string): number {
+  if (habit.targetPeriod === 'day') {
+    return calculateStreak(habit.completions, asOfDateStr);
+  }
+
+  let streak = 0;
+
+  const currentInfo = calculatePeriodInfo(habit, asOfDateStr);
+  if (currentInfo.completedCount >= habit.targetCount) {
+    streak++;
+  }
+
+  let anchor = stepToPreviousPeriod(asOfDateStr, habit.targetPeriod);
+  let safety = 0;
+  while (safety < 1000) {
+    safety++;
+    const completed = countFullPeriodCompletions(habit, anchor);
+    if (completed < habit.targetCount) break;
+    streak++;
+    anchor = stepToPreviousPeriod(anchor, habit.targetPeriod);
+  }
+
+  return streak;
+}
+
+function isPeriodEndDate(habit: Habit, dateStr: string): boolean {
+  const { end } = getPeriodBounds(dateStr, habit.targetPeriod);
+  return dateToString(end) === dateStr;
+}
+
+// Sum of pointValue for every habit completed on this date. This is the
+// only piece that fires every day — bonuses below only fire on the date a
+// period closes.
+function calculateBasePoints(habits: Habit[], dateStr: string): number {
+  return habits.reduce(
+    (sum, h) => sum + (h.completions[dateStr] === true ? h.pointValue : 0),
+    0
+  );
+}
+
+// Bonus points for a single habit on a single date: a target-met bonus
+// plus a period-streak bonus, evaluated only on the date a week/month
+// period closes. Daily-target habits are excluded entirely — for those,
+// "met" and "completed" are the same event already counted in base
+// points, so a bonus here would just double-count it.
+function getHabitBonusForDate(habit: Habit, dateStr: string): number {
+  if (habit.targetPeriod === 'day') return 0;
+  if (!isPeriodEndDate(habit, dateStr)) return 0;
+
+  const info = calculatePeriodInfo(habit, dateStr);
+  if (info.status !== 'met') return 0;
+
+  let bonus = habit.pointValue; // target-met bonus, one "extra day's" worth of points
+
+  const streak = calculatePeriodStreakAsOf(habit, dateStr);
+  if (streak > 0 && streak % PERIOD_STREAK_THRESHOLD === 0) {
+    bonus += PERIOD_STREAK_BONUS;
+  }
+
+  return bonus;
+}
+
+function calculateDayScore(habits: Habit[], dateStr: string): DayScore {
+  const basePoints = calculateBasePoints(habits, dateStr);
+  const bonusPoints = habits.reduce((sum, h) => sum + getHabitBonusForDate(h, dateStr), 0);
+  return { date: dateStr, basePoints, bonusPoints, totalPoints: basePoints + bonusPoints };
+}
+
 const HabitsContext = createContext<HabitsContextType | undefined>(undefined);
 
 export function HabitsProvider({ children }: { children: ReactNode }) {
@@ -462,7 +550,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     }));
   }
 
-  function addHabit(name: string, category: string, timeOfDay: TimeOfDay, targetCount: number, targetPeriod: Period) {
+  function addHabit(name: string, category: string, timeOfDay: TimeOfDay, targetCount: number, targetPeriod: Period, pointValue: number = DEFAULT_POINT_VALUE) {
     const trimmed = name.trim();
     if (!trimmed) return;
     const trimmedCategory = category.trim() || DEFAULT_CATEGORY;
@@ -475,6 +563,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
       targetCount,
       targetPeriod,
       order: maxOrder + 1,
+      pointValue,
       completions: {},
     };
     setHabits([...habits, newHabit]);
@@ -623,28 +712,41 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // Consecutive periods (in the habit's own unit — day/week/month) that
   // fully met the target, counting backward from the current one.
   function getPeriodStreak(habit: Habit): number {
-    if (habit.targetPeriod === 'day') {
-      return calculateStreak(habit.completions, today);
+    return calculatePeriodStreakAsOf(habit, today);
+  }
+
+  function getDayScore(dateStr: string): DayScore {
+    return calculateDayScore(habits, dateStr);
+  }
+
+  // Sum of daily totals from this calendar week's Monday through today —
+  // same "calendar-aligned week" definition used everywhere else (period
+  // status, momentum), so it lines up with what the rest of the app means
+  // by "this week."
+  function getWeekScore(): number {
+    const { start } = getPeriodBounds(today, 'week');
+    let total = 0;
+    const cursor = new Date(start);
+    const end = new Date(today);
+    while (cursor <= end) {
+      total += calculateDayScore(habits, dateToString(cursor)).totalPoints;
+      cursor.setDate(cursor.getDate() + 1);
     }
+    return total;
+  }
 
-    let streak = 0;
-
-    const currentInfo = calculatePeriodInfo(habit, today);
-    if (currentInfo.completedCount >= habit.targetCount) {
-      streak++;
+  // Daily score series for the trend chart, same shape/window convention
+  // as getCategoryScoreHistory (defaults to the last 90 days, ending today).
+  function getScoreHistory(days: number = 90): DayScore[] {
+    const points: DayScore[] = [];
+    const cursor = new Date(today);
+    cursor.setDate(cursor.getDate() - (days - 1));
+    for (let i = 0; i < days; i++) {
+      const ds = dateToString(cursor);
+      points.push(calculateDayScore(habits, ds));
+      cursor.setDate(cursor.getDate() + 1);
     }
-
-    let anchor = stepToPreviousPeriod(today, habit.targetPeriod);
-    let safety = 0;
-    while (safety < 1000) {
-      safety++;
-      const completed = countFullPeriodCompletions(habit, anchor);
-      if (completed < habit.targetCount) break;
-      streak++;
-      anchor = stepToPreviousPeriod(anchor, habit.targetPeriod);
-    }
-
-    return streak;
+    return points;
   }
 
   // Overall completion rate across every fully-elapsed period since the
@@ -751,6 +853,9 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getHabitHistorySquares,
         getPeriodStreak,
         getCompletionRate,
+        getDayScore,
+        getWeekScore,
+        getScoreHistory,
         viewMode,
         setViewMode,
         getOrderedHabits,
