@@ -1,4 +1,5 @@
 import { StyleSheet, Text, TouchableOpacity, ScrollView, SafeAreaView, View, Switch } from 'react-native';
+import { useRouter } from 'expo-router';
 import Animated, { LinearTransition, FadeIn, FadeOut, Easing } from 'react-native-reanimated';
 import { useHabits, PeriodStatus, TimeOfDay } from '../HabitsContext';
 
@@ -44,12 +45,14 @@ const REORDER_TRANSITION = LinearTransition
   .easing(Easing.bezier(0.83, 0, 0.17, 1));
 
 export default function HomeScreen() {
+  const router = useRouter();
   const {
     habits, loaded, today, selectedDate,
     goToPreviousDay, goToNextDay, goToToday, isViewingToday,
     toggleHabit, getStreak, getPeriodInfo, getCategoryColor,
     viewMode, setViewMode, getOrderedHabits,
     hideCompleted, setHideCompleted, shouldShowHabit,
+    swapHabit,
   } = useHabits();
 
   if (!loaded) return null;
@@ -119,6 +122,12 @@ export default function HomeScreen() {
         </View>
       </View>
 
+      {viewMode === 'auto' && (
+        <TouchableOpacity style={styles.scheduleButton} onPress={() => router.push('/schedule')}>
+          <Text style={styles.scheduleButtonText}>📅 View 4-week schedule</Text>
+        </TouchableOpacity>
+      )}
+
       <ScrollView contentContainerStyle={styles.scrollContent}>
         {sections.map(section => (
           <View key={section.title}>
@@ -146,44 +155,55 @@ export default function HomeScreen() {
                   entering={FadeIn}
                   exiting={FadeOut}
                 >
-                  <TouchableOpacity
-                    style={[styles.habitRow, { backgroundColor: rowColor }]}
-                    onPress={() => toggleHabit(item.id)}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <View style={styles.titleRow}>
-                        <Text style={styles.habitText}>{item.name}</Text>
-                        <View style={styles.categoryTag}>
-                          <Text style={styles.categoryTagText}>{item.category}</Text>
-                        </View>
-                      </View>
-
-                      <Text style={styles.habitMeta}>
-                        {item.targetCount}× per {item.targetPeriod}
-                      </Text>
-
-                      {!isDaily && (
-                        <>
-                          <View style={styles.squaresRow}>
-                            {periodInfo.squares.map(sq => (
-                              <View
-                                key={sq.date}
-                                style={[styles.square, sq.done ? styles.squareDone : styles.squareEmpty]}
-                              />
-                            ))}
+                  <View style={[styles.habitRow, { backgroundColor: rowColor }]}>
+                    <TouchableOpacity
+                      style={styles.habitRowTouchable}
+                      onPress={() => toggleHabit(item.id)}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <View style={styles.titleRow}>
+                          <Text style={styles.habitText}>{item.name}</Text>
+                          <View style={styles.categoryTag}>
+                            <Text style={styles.categoryTagText}>{item.category}</Text>
                           </View>
-                          <Text style={[styles.statusText, { color: STATUS_COLORS[periodInfo.status] }]}>
-                            {STATUS_LABELS[periodInfo.status]} · {periodInfo.completedCount}/{periodInfo.targetCount}
-                          </Text>
-                        </>
-                      )}
+                        </View>
 
-                      {isViewingToday && streak > 0 && (
-                        <Text style={styles.streakText}>🔥 {streak} day{streak !== 1 ? 's' : ''}</Text>
-                      )}
-                    </View>
-                    <Text style={styles.checkmark}>{doneThatDay ? '✅' : '⬜️'}</Text>
-                  </TouchableOpacity>
+                        <Text style={styles.habitMeta}>
+                          {item.targetCount}× per {item.targetPeriod}
+                        </Text>
+
+                        {!isDaily && (
+                          <>
+                            <View style={styles.squaresRow}>
+                              {periodInfo.squares.map(sq => (
+                                <View
+                                  key={sq.date}
+                                  style={[styles.square, sq.done ? styles.squareDone : styles.squareEmpty]}
+                                />
+                              ))}
+                            </View>
+                            <Text style={[styles.statusText, { color: STATUS_COLORS[periodInfo.status] }]}>
+                              {STATUS_LABELS[periodInfo.status]} · {periodInfo.completedCount}/{periodInfo.targetCount}
+                            </Text>
+                          </>
+                        )}
+
+                        {isViewingToday && streak > 0 && (
+                          <Text style={styles.streakText}>🔥 {streak} day{streak !== 1 ? 's' : ''}</Text>
+                        )}
+                      </View>
+                      <Text style={styles.checkmark}>{doneThatDay ? '✅' : '⬜️'}</Text>
+                    </TouchableOpacity>
+
+                    {viewMode === 'auto' && (
+                      <TouchableOpacity
+                        style={styles.swapButton}
+                        onPress={() => swapHabit(item.id)}
+                      >
+                        <Text style={styles.swapButtonText}>⇄</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
                 </Animated.View>
               );
             })}
@@ -248,13 +268,33 @@ const styles = StyleSheet.create({
   },
   habitRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 16,
     paddingHorizontal: 12,
     borderRadius: 10,
     marginBottom: 10,
   },
+  habitRowTouchable: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  swapButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginLeft: 6,
+  },
+  swapButtonText: { fontSize: 20, color: '#555' },
+  scheduleButton: {
+    alignSelf: 'center',
+    backgroundColor: '#f0f0f0',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  scheduleButtonText: { fontSize: 13, color: '#333', fontWeight: '600' },
   titleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   habitText: { fontSize: 18 },
   categoryTag: {

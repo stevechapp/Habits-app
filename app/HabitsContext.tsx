@@ -32,6 +32,7 @@ export type HistorySquare = { date: string; done: boolean };
 export type CompletionRate = { met: number; total: number; rate: number };
 export type DayScore = { date: string; basePoints: number; bonusPoints: number; totalPoints: number };
 export type PeriodComparison = { period: Period; current: number; previous: number; average: number };
+export type ScheduleDay = { date: string; scheduled: Habit[] };
 
 type StoredData = {
   version: number;
@@ -100,6 +101,8 @@ type HabitsContextType = {
   hideCompleted: boolean;
   setHideCompleted: (hide: boolean) => void;
   shouldShowHabit: (habit: Habit) => boolean;
+  swapHabit: (id: string) => void;
+  getScheduleProjection: (days?: number) => ScheduleDay[];
 };
 
 const STORAGE_KEY = 'habits';
@@ -920,6 +923,82 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return { met, total, rate };
   }
 
+  // Auto mode's explicit escape hatch: replaces one scheduled habit with
+  // whatever's next in line for urgency in the same section, re-running the
+  // exact same ranking computeScheduledIds used, minus everything already
+  // on today's schedule. If nothing qualifies, the habit is simply removed
+  // — swap becomes "drop," not "replace with something arbitrary." This is
+  // the one place today's snapshot is allowed to change after being frozen
+  // — a deliberate, explicit override, not an automatic recalculation.
+  function swapHabit(id: string) {
+    const habit = habits.find(h => h.id === id);
+    const snapshot = daySnapshots[selectedDate];
+    if (!habit || !snapshot) return;
+
+    const currentScheduled = snapshot.scheduledIds ?? [];
+
+    const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
+    const ranked = group
+      .map(h => ({ habit: h, status: calculateStatusIgnoringDate(h, selectedDate) }))
+      .filter(x => x.status !== 'met')
+      .filter(x => !currentScheduled.includes(x.habit.id))
+      .sort((a, b) => {
+        const diff = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
+        if (diff !== 0) return diff;
+        return a.habit.order - b.habit.order;
+      });
+
+    const replacement = ranked[0]?.habit;
+
+    const newScheduledIds = currentScheduled
+      .filter(sid => sid !== id)
+      .concat(replacement ? [replacement.id] : []);
+
+    setDaySnapshots(prev => ({
+      ...prev,
+      [selectedDate]: { ...snapshot, scheduledIds: newScheduledIds },
+    }));
+  }
+
+  // A read-only, forward-looking projection of what Auto mode would
+  // schedule over the coming days — recomputed fresh every call, nothing
+  // persisted. To project beyond today, it has to assume *something*
+  // about whether today's picks get done, since that changes what's still
+  // urgent tomorrow — so it simulates the best case: everything scheduled
+  // on a given day is treated as completed for the purpose of computing
+  // the *next* day's schedule. That simulation only ever touches a local
+  // working copy of completions; the real habits/completions data (and
+  // any actual daySnapshots) are never written to.
+  function getScheduleProjection(days: number = 28): ScheduleDay[] {
+    let simulatedHabits = habits.map(h => ({ ...h, completions: { ...h.completions } }));
+    const result: ScheduleDay[] = [];
+
+    const cursor = new Date(today);
+    for (let i = 0; i < days; i++) {
+      const ds = dateToString(cursor);
+      const scheduledIds = computeScheduledIds(simulatedHabits, ds);
+
+      // Return the real (non-simulated) habit objects for display, so
+      // names/categories/etc. are never accidentally sourced from the
+      // hypothetical completions used internally by the simulation.
+      const scheduled = scheduledIds
+        .map(id => habits.find(h => h.id === id))
+        .filter((h): h is Habit => h !== undefined);
+
+      result.push({ date: ds, scheduled });
+
+      simulatedHabits = simulatedHabits.map(h =>
+        scheduledIds.includes(h.id)
+          ? { ...h, completions: { ...h.completions, [ds]: true } }
+          : h
+      );
+
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    return result;
+  }
+
   function setViewMode(mode: ViewMode) {
     setViewModeState(mode);
   }
@@ -1008,6 +1087,8 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         hideCompleted,
         setHideCompleted,
         shouldShowHabit,
+        swapHabit,
+        getScheduleProjection,
       }}
     >
       {children}
