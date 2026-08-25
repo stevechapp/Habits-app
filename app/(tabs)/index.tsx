@@ -103,6 +103,14 @@ export default function HomeScreen() {
               Dynamic
             </Text>
           </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeButton, viewMode === 'auto' && styles.modeButtonActive]}
+            onPress={() => setViewMode('auto')}
+          >
+            <Text style={[styles.modeButtonText, viewMode === 'auto' && styles.modeButtonTextActive]}>
+              Auto
+            </Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.hideRow}>

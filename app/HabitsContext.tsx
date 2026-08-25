@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 export type TimeOfDay = 'morning' | 'afternoon' | 'evening';
 export type Period = 'day' | 'week' | 'month';
 export type PeriodStatus = 'met' | 'onTrack' | 'dueSoon' | 'behind';
-export type ViewMode = 'static' | 'dynamic';
+export type ViewMode = 'static' | 'dynamic' | 'auto';
 
 export type Habit = {
   id: string;
@@ -55,6 +55,7 @@ type StoredSettings = {
 type DaySnapshot = {
   orderedIds: string[]; // habit ids, most-neglected first, as of snapshot time
   completedAtSnapshot: string[]; // habit ids already done as of snapshot time
+  scheduledIds: string[]; // habit ids Auto mode picked for this date, capped per section
 };
 type DaySnapshots = Record<string, DaySnapshot>; // date string -> snapshot
 
@@ -260,6 +261,52 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
   return { status, completedCount, targetCount: habit.targetCount, squares };
 }
 
+// A habit's urgency for scheduling purposes, evaluated as if it hadn't
+// already been completed on dateStr. Without this, a habit that was
+// urgent this morning and got done before you even opened the app would
+// compute to 'met' and silently never make it onto today's schedule —
+// this keeps "was this worth scheduling today" independent of how early
+// you got to it.
+function calculateStatusIgnoringDate(habit: Habit, dateStr: string): PeriodStatus {
+  const habitAsIfNotDone: Habit = {
+    ...habit,
+    completions: { ...habit.completions, [dateStr]: false },
+  };
+  return calculatePeriodInfo(habitAsIfNotDone, dateStr).status;
+}
+
+// Picks Auto mode's schedule for a date: within each time-of-day section,
+// the most urgent habits first (behind, then dueSoon), topped up with the
+// next most-neglected on-track habits if there's room, capped at
+// MAX_SCHEDULED_PER_SECTION. Habits already 'met' for their period don't
+// need scheduling — filtering them out and sorting the rest by
+// STATUS_PRIORITY does both the ranking and the "urgent first, fill with
+// on-track" behaviour in one pass, since STATUS_PRIORITY already orders
+// behind < dueSoon < onTrack.
+const MAX_SCHEDULED_PER_SECTION = 3;
+
+function computeScheduledIds(habits: Habit[], dateStr: string): string[] {
+  const timeOfDays: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
+  const scheduled: string[] = [];
+
+  timeOfDays.forEach(timeOfDay => {
+    const group = habits.filter(h => h.timeOfDay === timeOfDay);
+
+    const ranked = group
+      .map(h => ({ habit: h, status: calculateStatusIgnoringDate(h, dateStr) }))
+      .filter(x => x.status !== 'met')
+      .sort((a, b) => {
+        const diff = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
+        if (diff !== 0) return diff;
+        return a.habit.order - b.habit.order;
+      });
+
+    ranked.slice(0, MAX_SCHEDULED_PER_SECTION).forEach(x => scheduled.push(x.habit.id));
+  });
+
+  return scheduled;
+}
+
 // Computes the neglect-ranked id list for a date from current habit data.
 // Only ever called once per date — see the snapshot effect below.
 function computeDaySnapshot(habits: Habit[], dateStr: string): DaySnapshot {
@@ -274,6 +321,7 @@ function computeDaySnapshot(habits: Habit[], dateStr: string): DaySnapshot {
   return {
     orderedIds: ranked.map(h => h.id),
     completedAtSnapshot: habits.filter(h => h.completions[dateStr] === true).map(h => h.id),
+    scheduledIds: computeScheduledIds(habits, dateStr),
   };
 }
 
@@ -534,12 +582,26 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // habits off after the snapshot exists has no effect on it; it can only
   // shape the snapshot for a date that hasn't been taken yet (e.g.
   // tomorrow, once tomorrow arrives and gets its own first-visit snapshot).
+  //
+  // Also backfills scheduledIds onto any snapshot that predates Auto mode
+  // (loaded from storage without that field) — this only fills in the new
+  // field; orderedIds and completedAtSnapshot stay exactly as originally
+  // frozen, so this isn't a re-snapshot, just closing a data-shape gap.
   useEffect(() => {
     if (!loaded || !daySnapshotsLoaded) return;
-    if (daySnapshots[selectedDate]) return;
 
-    const snapshot = computeDaySnapshot(habits, selectedDate);
-    setDaySnapshots(prev => ({ ...prev, [selectedDate]: snapshot }));
+    const existing = daySnapshots[selectedDate];
+
+    if (!existing) {
+      const snapshot = computeDaySnapshot(habits, selectedDate);
+      setDaySnapshots(prev => ({ ...prev, [selectedDate]: snapshot }));
+      return;
+    }
+
+    if (!existing.scheduledIds) {
+      const scheduledIds = computeScheduledIds(habits, selectedDate);
+      setDaySnapshots(prev => ({ ...prev, [selectedDate]: { ...existing, scheduledIds } }));
+    }
   }, [loaded, daySnapshotsLoaded, selectedDate, habits, daySnapshots]);
 
   function goToPreviousDay() {
@@ -866,12 +928,14 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     setHideCompletedState(hide);
   }
 
-  // Sorts a group of habits (already filtered to one timeOfDay) according
-  // to the current view mode. Static = manual `order`. Dynamic = the
-  // frozen per-day neglect ranking from daySnapshots, falling back to
-  // manual `order` for any habit not present in the snapshot (e.g. one
-  // added after the snapshot was taken today) and for the brief moment
-  // before today's first snapshot has been computed.
+  // Sorts (and, in Auto mode, filters) a group of habits already narrowed
+  // to one timeOfDay. Static = manual `order`. Dynamic = the frozen
+  // per-day neglect ranking from daySnapshots. Auto = that same ranking,
+  // but restricted to only the habits daySnapshots picked as today's
+  // schedule (see computeScheduledIds) — capped at
+  // MAX_SCHEDULED_PER_SECTION per section. All non-static modes fall back
+  // to manual `order`, unfiltered, for the brief moment before today's
+  // first snapshot has been computed.
   function getOrderedHabits(habitsInGroup: Habit[]): Habit[] {
     if (viewMode === 'static') {
       return [...habitsInGroup].sort((a, b) => a.order - b.order);
@@ -882,8 +946,12 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
       return [...habitsInGroup].sort((a, b) => a.order - b.order);
     }
 
+    const pool = viewMode === 'auto'
+      ? habitsInGroup.filter(h => (snapshot.scheduledIds ?? []).includes(h.id))
+      : habitsInGroup;
+
     const rank = new Map(snapshot.orderedIds.map((id, index) => [id, index]));
-    return [...habitsInGroup].sort((a, b) => {
+    return [...pool].sort((a, b) => {
       const rankA = rank.has(a.id) ? rank.get(a.id)! : Number.MAX_SAFE_INTEGER;
       const rankB = rank.has(b.id) ? rank.get(b.id)! : Number.MAX_SAFE_INTEGER;
       if (rankA !== rankB) return rankA - rankB;
