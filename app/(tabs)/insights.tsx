@@ -352,7 +352,7 @@ function pluralize(count: number, noun: string): string {
 export default function InsightsScreen() {
   const {
     habits, loaded, today, getCategoryScores, getCategoryScoreHistory,
-    getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
+    getLongestStreak, getHabitHistorySquares, getStreak, getPeriodStreak, getCompletionRate,
     getCategoryColor, getCategoryAccentColor, getDayScore, getScoreComparison,
     getScoreHistory, getPointsHistoryByCategory,
   } = useHabits();
@@ -408,6 +408,22 @@ export default function InsightsScreen() {
 
   const chartSize = Math.min(width - 32, 340);
   const trendWidth = width - 32;
+
+  // "Target streaks" — week/month habits, ranked by consecutive periods
+  // met. "Day streaks" — day habits, ranked by consecutive days done.
+  // Kept separate rather than merged into one ranking since a 3-week
+  // streak and a 3-day streak aren't really comparable numbers.
+  const targetStreakHabits = habits
+    .filter(h => h.targetPeriod !== 'day')
+    .map(h => ({ habit: h, streak: getPeriodStreak(h) }))
+    .filter(x => x.streak > 0)
+    .sort((a, b) => b.streak - a.streak);
+
+  const dayStreakHabits = habits
+    .filter(h => h.targetPeriod === 'day')
+    .map(h => ({ habit: h, streak: getStreak(h) }))
+    .filter(x => x.streak > 0)
+    .sort((a, b) => b.streak - a.streak);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -491,6 +507,43 @@ export default function InsightsScreen() {
             <View style={styles.chartWrap}>
               <PointsTrendChart dates={scoreDates} lines={chartLines} width={trendWidth} height={160} />
             </View>
+
+            <Text style={[styles.subheader, { marginTop: 24 }]}>Active streaks</Text>
+            {targetStreakHabits.length === 0 && dayStreakHabits.length === 0 && (
+              <Text style={styles.notice}>No active streaks yet — complete a habit to start one.</Text>
+            )}
+            {targetStreakHabits.length > 0 && (
+              <>
+                <Text style={styles.streakGroupLabel}>Target streaks</Text>
+                {targetStreakHabits.map(({ habit, streak }) => (
+                  <View
+                    key={habit.id}
+                    style={[styles.row, { backgroundColor: getCategoryColor(habit.category) }]}
+                  >
+                    <Text style={styles.categoryName}>{habit.name}</Text>
+                    <Text style={styles.streakValue}>
+                      🔥 {pluralize(streak, PERIOD_NOUNS[habit.targetPeriod])}
+                    </Text>
+                  </View>
+                ))}
+              </>
+            )}
+            {dayStreakHabits.length > 0 && (
+              <>
+                <Text style={[styles.streakGroupLabel, { marginTop: targetStreakHabits.length > 0 ? 12 : 0 }]}>
+                  Day streaks
+                </Text>
+                {dayStreakHabits.map(({ habit, streak }) => (
+                  <View
+                    key={habit.id}
+                    style={[styles.row, { backgroundColor: getCategoryColor(habit.category) }]}
+                  >
+                    <Text style={styles.categoryName}>{habit.name}</Text>
+                    <Text style={styles.streakValue}>🔥 {pluralize(streak, 'day')}</Text>
+                  </View>
+                ))}
+              </>
+            )}
 
             <Text style={[styles.subheader, { marginTop: 24 }]}>Category momentum (today)</Text>
             <View style={styles.chartWrap}>
@@ -588,6 +641,8 @@ const styles = StyleSheet.create({
   },
   categoryName: { fontSize: 17, fontWeight: '600' },
   score: { fontSize: 20, fontWeight: '700', color: '#333' },
+  streakGroupLabel: { fontSize: 12, color: '#aaa', fontWeight: '600', marginBottom: 6, textTransform: 'uppercase' },
+  streakValue: { fontSize: 14, fontWeight: '700', color: '#333' },
   scoreCardsRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
   categoryToggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
   categoryChip: {

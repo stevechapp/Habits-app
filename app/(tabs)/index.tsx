@@ -1,4 +1,5 @@
-import { StyleSheet, Text, TouchableOpacity, SectionList, SafeAreaView, View, Switch } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, ScrollView, SafeAreaView, View, Switch } from 'react-native';
+import Animated, { LinearTransition, FadeIn, FadeOut, Easing } from 'react-native-reanimated';
 import { useHabits, PeriodStatus, TimeOfDay } from '../HabitsContext';
 
 function formatDateLabel(dateStr: string, today: string): string {
@@ -33,6 +34,14 @@ const TIME_LABELS: Record<TimeOfDay, string> = {
   afternoon: 'Afternoon',
   evening: 'Evening',
 };
+
+// Shared transition used for reordering. Ease-in-out (slow start, faster
+// middle, slow finish) rather than ease-out — a pure ease-out launches at
+// full speed immediately, which reads as snappy no matter how gentle the
+// landing is. The slow start is what actually sells "floaty."
+const REORDER_TRANSITION = LinearTransition
+  .duration(1500)
+  .easing(Easing.bezier(0.83, 0, 0.17, 1));
 
 export default function HomeScreen() {
   const {
@@ -102,66 +111,77 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      <SectionList
-        sections={sections}
-        keyExtractor={item => item.id}
-        stickySectionHeadersEnabled={false}
-        renderSectionHeader={({ section }) => (
-          <View style={styles.sectionHeaderWrap}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.sectionHeaderText}>{section.title}</Text>
-            <View style={styles.dividerLine} />
-          </View>
-        )}
-        renderItem={({ item }) => {
-          const doneThatDay = item.completions[selectedDate] === true;
-          const streak = getStreak(item);
-          const periodInfo = getPeriodInfo(item);
-          const isDaily = item.targetPeriod === 'day';
-          const rowColor = doneThatDay ? '#d9f2d9' : getCategoryColor(item.category);
+      <ScrollView contentContainerStyle={styles.scrollContent}>
+        {sections.map(section => (
+          <View key={section.title}>
+            <View style={styles.sectionHeaderWrap}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.sectionHeaderText}>{section.title}</Text>
+              <View style={styles.dividerLine} />
+            </View>
 
-          return (
-            <TouchableOpacity
-              style={[styles.habitRow, { backgroundColor: rowColor }]}
-              onPress={() => toggleHabit(item.id)}
-            >
-              <View style={{ flex: 1 }}>
-                <View style={styles.titleRow}>
-                  <Text style={styles.habitText}>{item.name}</Text>
-                  <View style={styles.categoryTag}>
-                    <Text style={styles.categoryTagText}>{item.category}</Text>
-                  </View>
-                </View>
+            {section.data.map(item => {
+              const doneThatDay = item.completions[selectedDate] === true;
+              const streak = getStreak(item);
+              const periodInfo = getPeriodInfo(item);
+              const isDaily = item.targetPeriod === 'day';
+              const rowColor = doneThatDay ? '#d9f2d9' : getCategoryColor(item.category);
 
-                <Text style={styles.habitMeta}>
-                  {item.targetCount}× per {item.targetPeriod}
-                </Text>
+              return (
+                // The Animated.View (not the TouchableOpacity inside it) is what
+                // needs the stable `key` and the `layout` prop — Reanimated uses
+                // the key to recognize "this is the same row, just moved" across
+                // renders, and animates the position change instead of snapping.
+                <Animated.View
+                  key={item.id}
+                  layout={REORDER_TRANSITION}
+                  entering={FadeIn}
+                  exiting={FadeOut}
+                >
+                  <TouchableOpacity
+                    style={[styles.habitRow, { backgroundColor: rowColor }]}
+                    onPress={() => toggleHabit(item.id)}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <View style={styles.titleRow}>
+                        <Text style={styles.habitText}>{item.name}</Text>
+                        <View style={styles.categoryTag}>
+                          <Text style={styles.categoryTagText}>{item.category}</Text>
+                        </View>
+                      </View>
 
-                {!isDaily && (
-                  <>
-                    <View style={styles.squaresRow}>
-                      {periodInfo.squares.map(sq => (
-                        <View
-                          key={sq.date}
-                          style={[styles.square, sq.done ? styles.squareDone : styles.squareEmpty]}
-                        />
-                      ))}
+                      <Text style={styles.habitMeta}>
+                        {item.targetCount}× per {item.targetPeriod}
+                      </Text>
+
+                      {!isDaily && (
+                        <>
+                          <View style={styles.squaresRow}>
+                            {periodInfo.squares.map(sq => (
+                              <View
+                                key={sq.date}
+                                style={[styles.square, sq.done ? styles.squareDone : styles.squareEmpty]}
+                              />
+                            ))}
+                          </View>
+                          <Text style={[styles.statusText, { color: STATUS_COLORS[periodInfo.status] }]}>
+                            {STATUS_LABELS[periodInfo.status]} · {periodInfo.completedCount}/{periodInfo.targetCount}
+                          </Text>
+                        </>
+                      )}
+
+                      {isViewingToday && streak > 0 && (
+                        <Text style={styles.streakText}>🔥 {streak} day{streak !== 1 ? 's' : ''}</Text>
+                      )}
                     </View>
-                    <Text style={[styles.statusText, { color: STATUS_COLORS[periodInfo.status] }]}>
-                      {STATUS_LABELS[periodInfo.status]} · {periodInfo.completedCount}/{periodInfo.targetCount}
-                    </Text>
-                  </>
-                )}
-
-                {isViewingToday && streak > 0 && (
-                  <Text style={styles.streakText}>🔥 {streak} day{streak !== 1 ? 's' : ''}</Text>
-                )}
-              </View>
-              <Text style={styles.checkmark}>{doneThatDay ? '✅' : '⬜️'}</Text>
-            </TouchableOpacity>
-          );
-        }}
-      />
+                    <Text style={styles.checkmark}>{doneThatDay ? '✅' : '⬜️'}</Text>
+                  </TouchableOpacity>
+                </Animated.View>
+              );
+            })}
+          </View>
+        ))}
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -202,6 +222,7 @@ const styles = StyleSheet.create({
   modeButtonTextActive: { color: '#fff' },
   hideRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   hideLabel: { fontSize: 13, color: '#666' },
+  scrollContent: { paddingBottom: 40 },
   sectionHeaderWrap: {
     flexDirection: 'row',
     alignItems: 'center',
