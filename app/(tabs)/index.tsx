@@ -52,7 +52,7 @@ export default function HomeScreen() {
     toggleHabit, getStreak, getPeriodInfo, getCategoryColor,
     viewMode, setViewMode, getOrderedHabits,
     hideCompleted, setHideCompleted, shouldShowHabit,
-    swapHabit,
+    swapHabit, addOneMore, getNextCandidate,
   } = useHabits();
 
   if (!loaded) return null;
@@ -62,9 +62,13 @@ export default function HomeScreen() {
       const group = habits.filter(h => h.timeOfDay === timeOfDay);
       const ordered = getOrderedHabits(group);
       const visible = ordered.filter(shouldShowHabit);
-      return { title: TIME_LABELS[timeOfDay], data: visible };
+      // Computed from `ordered` (pre hide-completed filter), not `visible` —
+      // otherwise, once hide-completed empties the section, we'd never know
+      // it was actually "all done" and the One more? button couldn't appear.
+      const allDone = viewMode === 'auto' && ordered.length > 0 && ordered.every(h => h.completions[selectedDate] === true);
+      return { timeOfDay, title: TIME_LABELS[timeOfDay], data: visible, allDone };
     })
-    .filter(section => section.data.length > 0);
+    .filter(section => section.data.length > 0 || section.allDone);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -129,15 +133,18 @@ export default function HomeScreen() {
       )}
 
       <ScrollView contentContainerStyle={styles.scrollContent}>
-        {sections.map(section => (
-          <View key={section.title}>
-            <View style={styles.sectionHeaderWrap}>
-              <View style={styles.dividerLine} />
-              <Text style={styles.sectionHeaderText}>{section.title}</Text>
-              <View style={styles.dividerLine} />
-            </View>
+        {sections.map(section => {
+          const nextCandidate = section.allDone ? getNextCandidate(section.timeOfDay) : null;
 
-            {section.data.map(item => {
+          return (
+            <View key={section.title}>
+              <View style={styles.sectionHeaderWrap}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.sectionHeaderText}>{section.title}</Text>
+                <View style={styles.dividerLine} />
+              </View>
+
+              {section.data.map(item => {
               const doneThatDay = item.completions[selectedDate] === true;
               const streak = getStreak(item);
               const periodInfo = getPeriodInfo(item);
@@ -207,8 +214,18 @@ export default function HomeScreen() {
                 </Animated.View>
               );
             })}
-          </View>
-        ))}
+
+              {nextCandidate && (
+                <TouchableOpacity
+                  style={styles.oneMoreButton}
+                  onPress={() => addOneMore(section.timeOfDay)}
+                >
+                  <Text style={styles.oneMoreButtonText}>+ One more?</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          );
+        })}
       </ScrollView>
     </SafeAreaView>
   );
@@ -295,6 +312,18 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   scheduleButtonText: { fontSize: 13, color: '#333', fontWeight: '600' },
+  oneMoreButton: {
+    alignSelf: 'center',
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderStyle: 'dashed',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginTop: 2,
+    marginBottom: 10,
+  },
+  oneMoreButtonText: { fontSize: 13, color: '#666', fontWeight: '600' },
   titleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   habitText: { fontSize: 18 },
   categoryTag: {

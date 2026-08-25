@@ -102,6 +102,8 @@ type HabitsContextType = {
   setHideCompleted: (hide: boolean) => void;
   shouldShowHabit: (habit: Habit) => boolean;
   swapHabit: (id: string) => void;
+  addOneMore: (timeOfDay: TimeOfDay) => void;
+  getNextCandidate: (timeOfDay: TimeOfDay) => Habit | null;
   getScheduleProjection: (days?: number) => ScheduleDay[];
 };
 
@@ -923,21 +925,17 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return { met, total, rate };
   }
 
-  // Auto mode's explicit escape hatch: replaces one scheduled habit with
-  // whatever's next in line for urgency in the same section, re-running the
-  // exact same ranking computeScheduledIds used, minus everything already
-  // on today's schedule. If nothing qualifies, the habit is simply removed
-  // — swap becomes "drop," not "replace with something arbitrary." This is
-  // the one place today's snapshot is allowed to change after being frozen
-  // — a deliberate, explicit override, not an automatic recalculation.
-  function swapHabit(id: string) {
-    const habit = habits.find(h => h.id === id);
+  // The core of both swapHabit and addOneMore: within a section, who's the
+  // next most-urgent habit not already on today's schedule? Same ranking
+  // computeScheduledIds uses (urgent first, 'met' excluded), just re-run
+  // against whatever's currently scheduled rather than from scratch.
+  function getNextCandidate(timeOfDay: TimeOfDay): Habit | null {
     const snapshot = daySnapshots[selectedDate];
-    if (!habit || !snapshot) return;
+    if (!snapshot) return null;
 
     const currentScheduled = snapshot.scheduledIds ?? [];
+    const group = habits.filter(h => h.timeOfDay === timeOfDay);
 
-    const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
     const ranked = group
       .map(h => ({ habit: h, status: calculateStatusIgnoringDate(h, selectedDate) }))
       .filter(x => x.status !== 'met')
@@ -948,7 +946,22 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         return a.habit.order - b.habit.order;
       });
 
-    const replacement = ranked[0]?.habit;
+    return ranked[0]?.habit ?? null;
+  }
+
+  // Auto mode's explicit escape hatch: replaces one scheduled habit with
+  // whatever's next in line for urgency in the same section. If nothing
+  // qualifies, the habit is simply removed — swap becomes "drop," not
+  // "replace with something arbitrary." This is the one place today's
+  // snapshot is allowed to change after being frozen — a deliberate,
+  // explicit override, not an automatic recalculation.
+  function swapHabit(id: string) {
+    const habit = habits.find(h => h.id === id);
+    const snapshot = daySnapshots[selectedDate];
+    if (!habit || !snapshot) return;
+
+    const currentScheduled = snapshot.scheduledIds ?? [];
+    const replacement = getNextCandidate(habit.timeOfDay);
 
     const newScheduledIds = currentScheduled
       .filter(sid => sid !== id)
@@ -957,6 +970,22 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     setDaySnapshots(prev => ({
       ...prev,
       [selectedDate]: { ...snapshot, scheduledIds: newScheduledIds },
+    }));
+  }
+
+  // The other explicit escape hatch: adds one more habit to a section on
+  // top of the usual cap, once everything already scheduled there is done.
+  // Deliberately doesn't touch anything else about the snapshot — just
+  // appends one id, same "frozen unless you explicitly ask" rule as swap.
+  function addOneMore(timeOfDay: TimeOfDay) {
+    const snapshot = daySnapshots[selectedDate];
+    const candidate = getNextCandidate(timeOfDay);
+    if (!snapshot || !candidate) return;
+
+    const currentScheduled = snapshot.scheduledIds ?? [];
+    setDaySnapshots(prev => ({
+      ...prev,
+      [selectedDate]: { ...snapshot, scheduledIds: [...currentScheduled, candidate.id] },
     }));
   }
 
@@ -1088,6 +1117,8 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         setHideCompleted,
         shouldShowHabit,
         swapHabit,
+        addOneMore,
+        getNextCandidate,
         getScheduleProjection,
       }}
     >
