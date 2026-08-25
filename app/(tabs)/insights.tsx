@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { StyleSheet, Text, SafeAreaView, View, ScrollView, Pressable, useWindowDimensions } from 'react-native';
 import Svg, { Polygon, Polyline, Line, Circle, Text as SvgText } from 'react-native-svg';
-import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate, DayScore } from '../HabitsContext';
+import { useHabits, CategoryScore, CategoryScoreHistoryPoint, Habit, HistorySquare, CompletionRate, DayScore, Period, PeriodComparison } from '../HabitsContext';
 
 const GRID_LEVELS = [0.25, 0.5, 0.75, 1.0];
 const CHART_ACCENT = '#7c3aed';
@@ -254,6 +254,40 @@ function PointsTrendChart({
   );
 }
 
+const COMPARISON_LABELS: Record<Period, string> = {
+  day: 'yesterday',
+  week: 'last week',
+  month: 'last month',
+};
+
+function formatComparisonLine(comparison: PeriodComparison): string {
+  const diff = comparison.current - comparison.previous;
+  const arrow = diff > 0 ? '▲' : diff < 0 ? '▼' : '—';
+  const diffText = diff === 0 ? 'even' : `${arrow} ${Math.abs(diff)}`;
+  return `${diffText} vs ${COMPARISON_LABELS[comparison.period]} · avg ${comparison.average}`;
+}
+
+function ScoreCard({
+  label,
+  value,
+  bonus,
+  comparison,
+}: {
+  label: string;
+  value: number;
+  bonus?: number;
+  comparison: PeriodComparison;
+}) {
+  return (
+    <View style={styles.scoreCard}>
+      <Text style={styles.scoreCardLabel}>{label}</Text>
+      <Text style={styles.scoreCardValue}>{value}</Text>
+      {!!bonus && bonus > 0 && <Text style={styles.scoreCardBonus}>+{bonus} bonus</Text>}
+      <Text style={styles.scoreCardComparison}>{formatComparisonLine(comparison)}</Text>
+    </View>
+  );
+}
+
 function buildWeekColumns(squares: HistorySquare[]): (HistorySquare | null)[][] {
   if (squares.length === 0) return [];
 
@@ -319,7 +353,7 @@ export default function InsightsScreen() {
   const {
     habits, loaded, today, getCategoryScores, getCategoryScoreHistory,
     getLongestStreak, getHabitHistorySquares, getPeriodStreak, getCompletionRate,
-    getCategoryColor, getCategoryAccentColor, getDayScore, getWeekScore,
+    getCategoryColor, getCategoryAccentColor, getDayScore, getScoreComparison,
     getScoreHistory, getPointsHistoryByCategory,
   } = useHabits();
   const { width } = useWindowDimensions();
@@ -330,6 +364,7 @@ export default function InsightsScreen() {
   // series must stay selected, so clearing the last one falls back to All
   // rather than leaving the chart empty.
   const [selectedSeries, setSelectedSeries] = useState<string[]>(['All']);
+  const [chartWindowDays, setChartWindowDays] = useState(90);
 
   function toggleSeries(key: string) {
     setSelectedSeries(prev => {
@@ -351,10 +386,12 @@ export default function InsightsScreen() {
   // Otherwise they're scoped to just the chosen categories.
   const cardCategoriesFilter = includesAll ? undefined : selectedCategoryNames;
   const todayScore = getDayScore(today, cardCategoriesFilter);
-  const weekScore = getWeekScore(cardCategoriesFilter);
+  const dayComparison = getScoreComparison('day', cardCategoriesFilter);
+  const weekComparison = getScoreComparison('week', cardCategoriesFilter);
+  const monthComparison = getScoreComparison('month', cardCategoriesFilter);
 
-  const scoreHistory = getScoreHistory();
-  const categoryPointsHistory = getPointsHistoryByCategory();
+  const scoreHistory = getScoreHistory(chartWindowDays);
+  const categoryPointsHistory = getPointsHistoryByCategory(chartWindowDays);
   const scoreDates = scoreHistory.map(s => s.date);
   const chartLines: ChartLine[] = [
     ...(includesAll
@@ -414,21 +451,41 @@ export default function InsightsScreen() {
             </View>
 
             <View style={styles.scoreCardsRow}>
-              <View style={styles.scoreCard}>
-                <Text style={styles.scoreCardLabel}>
-                  Today{!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}
-                </Text>
-                <Text style={styles.scoreCardValue}>{todayScore.totalPoints}</Text>
-                {todayScore.bonusPoints > 0 && (
-                  <Text style={styles.scoreCardBonus}>+{todayScore.bonusPoints} bonus</Text>
-                )}
-              </View>
-              <View style={styles.scoreCard}>
-                <Text style={styles.scoreCardLabel}>
-                  This week{!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}
-                </Text>
-                <Text style={styles.scoreCardValue}>{weekScore}</Text>
-              </View>
+              <ScoreCard
+                label={`Today${!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}`}
+                value={todayScore.totalPoints}
+                bonus={todayScore.bonusPoints}
+                comparison={dayComparison}
+              />
+              <ScoreCard
+                label={`Week${!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}`}
+                value={weekComparison.current}
+                comparison={weekComparison}
+              />
+              <ScoreCard
+                label={`Month${!includesAll ? ` · ${selectedCategoryNames.join(', ')}` : ''}`}
+                value={monthComparison.current}
+                comparison={monthComparison}
+              />
+            </View>
+
+            <View style={styles.chartWindowRow}>
+              {[30, 90, 365].map(days => (
+                <Pressable
+                  key={days}
+                  onPress={() => setChartWindowDays(days)}
+                  style={[styles.windowChip, chartWindowDays === days && styles.windowChipActive]}
+                >
+                  <Text
+                    style={[
+                      styles.windowChipText,
+                      chartWindowDays === days && styles.windowChipTextActive,
+                    ]}
+                  >
+                    {days}d
+                  </Text>
+                </Pressable>
+              ))}
             </View>
 
             <View style={styles.chartWrap}>
@@ -531,7 +588,7 @@ const styles = StyleSheet.create({
   },
   categoryName: { fontSize: 17, fontWeight: '600' },
   score: { fontSize: 20, fontWeight: '700', color: '#333' },
-  scoreCardsRow: { flexDirection: 'row', gap: 10, marginBottom: 4 },
+  scoreCardsRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
   categoryToggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
   categoryChip: {
     paddingVertical: 6,
@@ -542,16 +599,27 @@ const styles = StyleSheet.create({
   categoryChipActiveAll: { backgroundColor: SCORE_ACCENT },
   categoryChipText: { fontSize: 13, fontWeight: '600', color: '#666' },
   categoryChipTextActive: { color: '#fff' },
+  chartWindowRow: { flexDirection: 'row', gap: 8, marginBottom: 4 },
+  windowChip: {
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: '#F2F2F2',
+  },
+  windowChipActive: { backgroundColor: '#333' },
+  windowChipText: { fontSize: 11, fontWeight: '600', color: '#888' },
+  windowChipTextActive: { color: '#fff' },
   scoreCard: {
     flex: 1,
     backgroundColor: '#FFFBEB',
     borderRadius: 10,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
   },
-  scoreCardLabel: { fontSize: 12, color: '#92700C', fontWeight: '600', marginBottom: 4 },
-  scoreCardValue: { fontSize: 24, fontWeight: '700', color: '#92700C' },
-  scoreCardBonus: { fontSize: 11, color: '#B45309', fontWeight: '600', marginTop: 2 },
+  scoreCardLabel: { fontSize: 11, color: '#92700C', fontWeight: '600', marginBottom: 4 },
+  scoreCardValue: { fontSize: 20, fontWeight: '700', color: '#92700C' },
+  scoreCardBonus: { fontSize: 10, color: '#B45309', fontWeight: '600', marginTop: 2 },
+  scoreCardComparison: { fontSize: 10, color: '#A8895A', marginTop: 4 },
   legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 8 },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   legendSwatch: { width: 12, height: 12, borderRadius: 3 },

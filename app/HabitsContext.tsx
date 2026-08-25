@@ -31,6 +31,7 @@ export type CategoryScoreHistoryPoint = { date: string; scores: Record<string, n
 export type HistorySquare = { date: string; done: boolean };
 export type CompletionRate = { met: number; total: number; rate: number };
 export type DayScore = { date: string; basePoints: number; bonusPoints: number; totalPoints: number };
+export type PeriodComparison = { period: Period; current: number; previous: number; average: number };
 
 type StoredData = {
   version: number;
@@ -86,6 +87,8 @@ type HabitsContextType = {
   // Points / scoring
   getDayScore: (dateStr: string, categories?: string[]) => DayScore;
   getWeekScore: (categories?: string[]) => number;
+  getMonthScore: (categories?: string[]) => number;
+  getScoreComparison: (period: Period, categories?: string[]) => PeriodComparison;
   getScoreHistory: (days?: number) => DayScore[];
   getPointsHistoryByCategory: (days?: number) => CategoryScoreHistoryPoint[];
   // View mode / neglect-sorting
@@ -106,6 +109,7 @@ const DEFAULT_CATEGORY = 'Uncategorized';
 const DEFAULT_POINT_VALUE = 10;
 const PERIOD_STREAK_BONUS = 15; // flat bonus every PERIOD_STREAK_THRESHOLD-th consecutive met period
 const PERIOD_STREAK_THRESHOLD = 3;
+const COMPARISON_LOOKBACK = 5; // how many prior completed periods the "average" comparison covers
 
 const defaultHabits: Habit[] = [
   { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
@@ -420,6 +424,21 @@ function getHabitBonusForDate(habit: Habit, dateStr: string): number {
   return bonus;
 }
 
+// Sums total points across any period type — the period containing
+// anchorDateStr, whatever its bounds are. Works unmodified for a
+// currently-in-progress period (e.g. this week, with days still to come)
+// because future dates simply have no completions yet and contribute 0.
+function sumPointsForPeriod(scoped: Habit[], anchorDateStr: string, period: Period): number {
+  const { start, end } = getPeriodBounds(anchorDateStr, period);
+  let total = 0;
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    total += calculateDayScore(scoped, dateToString(cursor)).totalPoints;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return total;
+}
+
 function calculateDayScore(habits: Habit[], dateStr: string): DayScore {
   const basePoints = calculateBasePoints(habits, dateStr);
   const bonusPoints = habits.reduce((sum, h) => sum + getHabitBonusForDate(h, dateStr), 0);
@@ -728,15 +747,38 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // habits, same convention as getDayScore.
   function getWeekScore(categories?: string[]): number {
     const scoped = categories ? habits.filter(h => categories.includes(h.category)) : habits;
-    const { start } = getPeriodBounds(today, 'week');
+    return sumPointsForPeriod(scoped, today, 'week');
+  }
+
+  // Same idea as getWeekScore, but for the calendar month to date.
+  function getMonthScore(categories?: string[]): number {
+    const scoped = categories ? habits.filter(h => categories.includes(h.category)) : habits;
+    return sumPointsForPeriod(scoped, today, 'month');
+  }
+
+  // Compares the current (possibly in-progress) day/week/month total
+  // against the immediately preceding period, and against the average of
+  // the COMPARISON_LOOKBACK completed periods before that — e.g. "today
+  // vs yesterday, and vs your average day over the last 5." The average
+  // deliberately starts from the previous period, not the current one, so
+  // an in-progress period's partial total is never averaged in alongside
+  // completed ones.
+  function getScoreComparison(period: Period, categories?: string[]): PeriodComparison {
+    const scoped = categories ? habits.filter(h => categories.includes(h.category)) : habits;
+
+    const current = sumPointsForPeriod(scoped, today, period);
+
+    let anchor = stepToPreviousPeriod(today, period);
+    const previous = sumPointsForPeriod(scoped, anchor, period);
+
     let total = 0;
-    const cursor = new Date(start);
-    const end = new Date(today);
-    while (cursor <= end) {
-      total += calculateDayScore(scoped, dateToString(cursor)).totalPoints;
-      cursor.setDate(cursor.getDate() + 1);
+    for (let i = 0; i < COMPARISON_LOOKBACK; i++) {
+      total += sumPointsForPeriod(scoped, anchor, period);
+      anchor = stepToPreviousPeriod(anchor, period);
     }
-    return total;
+    const average = Math.round(total / COMPARISON_LOOKBACK);
+
+    return { period, current, previous, average };
   }
 
   // Daily score series for the trend chart, same shape/window convention
@@ -888,6 +930,8 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getCompletionRate,
         getDayScore,
         getWeekScore,
+        getMonthScore,
+        getScoreComparison,
         getScoreHistory,
         getPointsHistoryByCategory,
         viewMode,
