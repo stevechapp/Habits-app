@@ -114,6 +114,7 @@ type HabitsContextType = {
   // Auto mode per-section guide counts
   sectionScheduleCounts: SectionCounts;
   setSectionScheduleCount: (timeOfDay: TimeOfDay, count: number) => void;
+  getSectionDemand: (timeOfDay: TimeOfDay) => number;
 };
 
 const STORAGE_KEY = 'habits';
@@ -130,6 +131,12 @@ const COMPARISON_LOOKBACK = 5; // how many prior completed periods the "average"
 // Adjustable per-section at runtime via setSectionScheduleCount; this is
 // just the starting point for a fresh install / before any preference is set.
 const DEFAULT_SECTION_COUNTS: SectionCounts = { morning: 3, afternoon: 3, evening: 3 };
+
+// Average days in a month, for the capacity-warning estimate below. Not
+// used anywhere in real scheduling — getPeriodBounds handles actual
+// calendar months exactly (28-31 days). This is purely a rough constant
+// for turning "4x a month" into a comparable daily rate.
+const AVERAGE_DAYS_IN_MONTH = 30.44;
 
 const defaultHabits: Habit[] = [
   { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
@@ -1160,6 +1167,25 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     setSectionScheduleCountsState(prev => ({ ...prev, [timeOfDay]: clamped }));
   }
 
+  // Average daily "slot demand" a section's habits collectively need to
+  // stay on track — e.g. a 3x/week habit needs about 0.43 of a slot per
+  // day, a daily habit needs a full 1. Summed across a section and
+  // compared against its guide number, this is what powers the "this
+  // count is too low" warning: if demand exceeds the count, it's not
+  // just tight, it's structurally impossible for every habit in that
+  // section to get enough turns no matter how the ranking works, since
+  // there aren't enough days to go around. Purely a planning estimate —
+  // doesn't feed into computeScheduledIds or affect what actually gets
+  // scheduled.
+  function getSectionDemand(timeOfDay: TimeOfDay): number {
+    return habits
+      .filter(h => h.timeOfDay === timeOfDay)
+      .reduce((sum, h) => {
+        const periodDays = h.targetPeriod === 'day' ? 1 : h.targetPeriod === 'week' ? 7 : AVERAGE_DAYS_IN_MONTH;
+        return sum + h.targetCount / periodDays;
+      }, 0);
+  }
+
   // Sorts (and, in Auto mode, filters) a group of habits already narrowed
   // to one timeOfDay. Static = manual `order`. Dynamic = the frozen
   // per-day neglect ranking from daySnapshots. Auto = that same ranking,
@@ -1246,6 +1272,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getScheduleProjection,
         sectionScheduleCounts,
         setSectionScheduleCount,
+        getSectionDemand,
       }}
     >
       {children}

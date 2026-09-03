@@ -36,6 +36,14 @@ const TIME_LABELS: Record<TimeOfDay, string> = {
   evening: 'Evening',
 };
 
+// Short labels for the per-section count steppers — the full labels above
+// are a bit wide for a small stacked card, so this trims them further.
+const TIME_SHORT_LABELS: Record<TimeOfDay, string> = {
+  morning: 'AM',
+  afternoon: 'Aft',
+  evening: 'Eve',
+};
+
 // Shared transition used for reordering. Ease-in-out (slow start, faster
 // middle, slow finish) rather than ease-out — a pure ease-out launches at
 // full speed immediately, which reads as snappy no matter how gentle the
@@ -53,6 +61,7 @@ export default function HomeScreen() {
     viewMode, setViewMode, getOrderedHabits,
     hideCompleted, setHideCompleted, shouldShowHabit,
     swapHabit, addOneMore, getNextCandidate,
+    sectionScheduleCounts, setSectionScheduleCount, getSectionDemand,
   } = useHabits();
 
   if (!loaded) return null;
@@ -127,9 +136,45 @@ export default function HomeScreen() {
       </View>
 
       {viewMode === 'auto' && (
-        <TouchableOpacity style={styles.scheduleButton} onPress={() => router.push('/schedule')}>
-          <Text style={styles.scheduleButtonText}>📅 View 4-week schedule</Text>
-        </TouchableOpacity>
+        <>
+          <View style={styles.sectionCountsRow}>
+            {TIME_ORDER.map(timeOfDay => {
+              const count = sectionScheduleCounts[timeOfDay];
+              const demand = getSectionDemand(timeOfDay);
+              const isOverCapacity = demand > count;
+
+              return (
+                <View key={timeOfDay} style={styles.sectionCountCard}>
+                  <Text style={styles.sectionCountLabel}>{TIME_SHORT_LABELS[timeOfDay]}</Text>
+                  <View style={styles.stepperRow}>
+                    <TouchableOpacity
+                      style={styles.stepperButton}
+                      onPress={() => setSectionScheduleCount(timeOfDay, count - 1)}
+                    >
+                      <Text style={styles.stepperButtonText}>−</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.stepperValue}>{count}</Text>
+                    <TouchableOpacity
+                      style={styles.stepperButton}
+                      onPress={() => setSectionScheduleCount(timeOfDay, count + 1)}
+                    >
+                      <Text style={styles.stepperButtonText}>+</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {isOverCapacity && (
+                    <Text style={styles.capacityWarning}>
+                      ⚠ needs ~{demand.toFixed(1)}/day
+                    </Text>
+                  )}
+                </View>
+              );
+            })}
+          </View>
+
+          <TouchableOpacity style={styles.scheduleButton} onPress={() => router.push('/schedule')}>
+            <Text style={styles.scheduleButtonText}>📅 View 4-week schedule</Text>
+          </TouchableOpacity>
+        </>
       )}
 
       <ScrollView contentContainerStyle={styles.scrollContent}>
@@ -267,6 +312,46 @@ const styles = StyleSheet.create({
   modeButtonTextActive: { color: '#fff' },
   hideRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   hideLabel: { fontSize: 13, color: '#666' },
+  sectionCountsRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 12,
+  },
+  sectionCountCard: {
+    alignItems: 'center',
+    backgroundColor: '#f7f7f7',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    minWidth: 84,
+  },
+  sectionCountLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#999',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  stepperRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  stepperButton: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#e5e5e5',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepperButtonText: { fontSize: 16, fontWeight: '700', color: '#333', lineHeight: 18 },
+  stepperValue: { fontSize: 15, fontWeight: '700', color: '#333', minWidth: 18, textAlign: 'center' },
+  capacityWarning: {
+    fontSize: 10,
+    color: '#c0392b',
+    fontWeight: '600',
+    marginTop: 4,
+    textAlign: 'center',
+  },
   scrollContent: { paddingBottom: 40 },
   sectionHeaderWrap: {
     flexDirection: 'row',
