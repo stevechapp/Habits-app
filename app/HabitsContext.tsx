@@ -1,10 +1,11 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export type TimeOfDay = 'morning' | 'afternoon' | 'evening';
 export type Period = 'day' | 'week' | 'month';
 export type PeriodStatus = 'met' | 'onTrack' | 'dueSoon' | 'behind';
 export type ViewMode = 'static' | 'dynamic' | 'auto';
+export type SectionCounts = Record<TimeOfDay, number>;
 
 export type Habit = {
   id: string;
@@ -22,6 +23,10 @@ export type PeriodInfo = {
   status: PeriodStatus;
   completedCount: number;
   targetCount: number;
+  // Days of buffer before this habit would tip into 'dueSoon': how many
+  // fewer completions than available days it currently has. 0 means
+  // today is the last safe day to skip; negative means already behind.
+  slack: number;
   squares: { date: string; done: boolean }[];
 };
 
@@ -45,6 +50,7 @@ type StoredData = {
 type StoredSettings = {
   viewMode: ViewMode;
   hideCompleted: boolean;
+  sectionScheduleCounts: SectionCounts;
 };
 
 // A DaySnapshot is computed once, the first time a given date is viewed,
@@ -105,6 +111,9 @@ type HabitsContextType = {
   addOneMore: (timeOfDay: TimeOfDay) => void;
   getNextCandidate: (timeOfDay: TimeOfDay) => Habit | null;
   getScheduleProjection: (days?: number) => ScheduleDay[];
+  // Auto mode per-section guide counts
+  sectionScheduleCounts: SectionCounts;
+  setSectionScheduleCount: (timeOfDay: TimeOfDay, count: number) => void;
 };
 
 const STORAGE_KEY = 'habits';
@@ -117,6 +126,11 @@ const PERIOD_STREAK_BONUS = 15; // flat bonus every PERIOD_STREAK_THRESHOLD-th c
 const PERIOD_STREAK_THRESHOLD = 3;
 const COMPARISON_LOOKBACK = 5; // how many prior completed periods the "average" comparison covers
 
+// Default number of habits Auto mode schedules per time-of-day section.
+// Adjustable per-section at runtime via setSectionScheduleCount; this is
+// just the starting point for a fresh install / before any preference is set.
+const DEFAULT_SECTION_COUNTS: SectionCounts = { morning: 3, afternoon: 3, evening: 3 };
+
 const defaultHabits: Habit[] = [
   { id: '1', name: 'Stretch', category: 'Body', timeOfDay: 'morning', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
   { id: '2', name: 'Drink water', category: 'Body', timeOfDay: 'afternoon', targetCount: 1, targetPeriod: 'day', order: 0, pointValue: DEFAULT_POINT_VALUE, completions: {} },
@@ -126,6 +140,7 @@ const defaultHabits: Habit[] = [
 const defaultSettings: StoredSettings = {
   viewMode: 'static',
   hideCompleted: false,
+  sectionScheduleCounts: DEFAULT_SECTION_COUNTS,
 };
 
 // Ranks PeriodStatus from most to least neglected. Used for dynamic sort order
@@ -251,6 +266,7 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
   const selectedDoneAlready = habit.completions[selectedDate] === true;
   const availableDays = daysRemainingAfterSelected + (selectedDoneAlready ? 0 : 1);
   const remainingNeeded = habit.targetCount - completedCount;
+  const slack = availableDays - remainingNeeded;
 
   let status: PeriodStatus;
   if (remainingNeeded <= 0) {
@@ -263,7 +279,7 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
     status = 'onTrack';
   }
 
-  return { status, completedCount, targetCount: habit.targetCount, squares };
+  return { status, completedCount, targetCount: habit.targetCount, slack, squares };
 }
 
 // A habit's urgency for scheduling purposes, evaluated as if it hadn't
@@ -272,25 +288,35 @@ function calculatePeriodInfo(habit: Habit, selectedDate: string): PeriodInfo {
 // compute to 'met' and silently never make it onto today's schedule —
 // this keeps "was this worth scheduling today" independent of how early
 // you got to it.
-function calculateStatusIgnoringDate(habit: Habit, dateStr: string): PeriodStatus {
+function calculateInfoIgnoringDate(habit: Habit, dateStr: string): PeriodInfo {
   const habitAsIfNotDone: Habit = {
     ...habit,
     completions: { ...habit.completions, [dateStr]: false },
   };
-  return calculatePeriodInfo(habitAsIfNotDone, dateStr).status;
+  return calculatePeriodInfo(habitAsIfNotDone, dateStr);
 }
 
 // Picks Auto mode's schedule for a date: within each time-of-day section,
-// the most urgent habits first (behind, then dueSoon), topped up with the
-// next most-neglected on-track habits if there's room, capped at
-// MAX_SCHEDULED_PER_SECTION. Habits already 'met' for their period don't
-// need scheduling — filtering them out and sorting the rest by
-// STATUS_PRIORITY does both the ranking and the "urgent first, fill with
-// on-track" behaviour in one pass, since STATUS_PRIORITY already orders
-// behind < dueSoon < onTrack.
-const MAX_SCHEDULED_PER_SECTION = 3;
-
-function computeScheduledIds(habits: Habit[], dateStr: string): string[] {
+// every not-yet-met habit is a candidate — there's no "too early to
+// bother" cutoff, because if a habit still needs progress this period,
+// today is as valid a day for it as any other. Candidates are ranked by
+// urgency (behind, then dueSoon, then onTrack), with slack (ascending) as
+// a tiebreak within a status tier so the closest-to-due habit wins a
+// section's limited slots, and each section is filled up to its own
+// guide number (sectionCounts). Previously this filtered out onTrack
+// habits with more than a day of slack, which was meant to stop
+// low-frequency habits getting scheduled repeatedly — but for someone
+// with few/no daily habits, that filter could empty a whole section (or
+// the whole day) even though there was still real progress to make.
+// NOTE: this always-fill-to-N approach makes the known "same low-frequency
+// habit on consecutive simulated days" issue more visible, not less —
+// that's being tracked as a separate follow-up (minimum-gap enforcement),
+// not fixed here.
+//
+// Separately, anything already completed on dateStr is always kept in the
+// result on top of the ranked picks (see completedTodayIds below) — so
+// checking a habit off is never what causes it to drop out of view.
+function computeScheduledIds(habits: Habit[], dateStr: string, sectionCounts: SectionCounts): string[] {
   const timeOfDays: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
   const scheduled: string[] = [];
 
@@ -298,15 +324,36 @@ function computeScheduledIds(habits: Habit[], dateStr: string): string[] {
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
 
     const ranked = group
-      .map(h => ({ habit: h, status: calculateStatusIgnoringDate(h, dateStr) }))
-      .filter(x => x.status !== 'met')
+      .map(h => ({ habit: h, info: calculateInfoIgnoringDate(h, dateStr) }))
+      // 'met' habits don't need scheduling — everything else is fair game.
+      .filter(x => x.info.status !== 'met')
       .sort((a, b) => {
-        const diff = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
+        const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
         if (diff !== 0) return diff;
+        const slackDiff = a.info.slack - b.info.slack;
+        if (slackDiff !== 0) return slackDiff;
         return a.habit.order - b.habit.order;
       });
 
-    ranked.slice(0, MAX_SCHEDULED_PER_SECTION).forEach(x => scheduled.push(x.habit.id));
+    const topPicks = ranked.slice(0, sectionCounts[timeOfDay]).map(x => x.habit.id);
+
+    // Anything already completed on dateStr stays visible regardless of
+    // the ranking above — being marked done is never a reason for a habit
+    // to disappear from the day you did it, even if it's technically
+    // 'met' for its period now, or if more urgent habits filled the
+    // section's usual slots. This can push a section past sectionCounts
+    // for that one day; that's intentional, since the alternative is a
+    // completed habit vanishing out from under you.
+    const completedTodayIds = group
+      .filter(h => h.completions[dateStr] === true)
+      .map(h => h.id);
+
+    const sectionIds = [...topPicks];
+    completedTodayIds.forEach(id => {
+      if (!sectionIds.includes(id)) sectionIds.push(id);
+    });
+
+    sectionIds.forEach(id => scheduled.push(id));
   });
 
   return scheduled;
@@ -314,7 +361,7 @@ function computeScheduledIds(habits: Habit[], dateStr: string): string[] {
 
 // Computes the neglect-ranked id list for a date from current habit data.
 // Only ever called once per date — see the snapshot effect below.
-function computeDaySnapshot(habits: Habit[], dateStr: string): DaySnapshot {
+function computeDaySnapshot(habits: Habit[], dateStr: string, sectionCounts: SectionCounts): DaySnapshot {
   const ranked = [...habits].sort((a, b) => {
     const statusA = calculatePeriodInfo(a, dateStr).status;
     const statusB = calculatePeriodInfo(b, dateStr).status;
@@ -326,7 +373,7 @@ function computeDaySnapshot(habits: Habit[], dateStr: string): DaySnapshot {
   return {
     orderedIds: ranked.map(h => h.id),
     completedAtSnapshot: habits.filter(h => h.completions[dateStr] === true).map(h => h.id),
-    scheduledIds: computeScheduledIds(habits, dateStr),
+    scheduledIds: computeScheduledIds(habits, dateStr, sectionCounts),
   };
 }
 
@@ -508,6 +555,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
 
   const [viewMode, setViewModeState] = useState<ViewMode>(defaultSettings.viewMode);
   const [hideCompleted, setHideCompletedState] = useState<boolean>(defaultSettings.hideCompleted);
+  const [sectionScheduleCounts, setSectionScheduleCountsState] = useState<SectionCounts>(defaultSettings.sectionScheduleCounts);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const [daySnapshots, setDaySnapshots] = useState<DaySnapshots>({});
@@ -552,6 +600,14 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         const parsed = JSON.parse(stored) as Partial<StoredSettings>;
         setViewModeState(parsed.viewMode ?? defaultSettings.viewMode);
         setHideCompletedState(parsed.hideCompleted ?? defaultSettings.hideCompleted);
+        // Merged over defaults (not just ??'d wholesale) so that a settings
+        // blob saved before this field existed, or one missing a section
+        // for some other reason, still gets a usable count for every
+        // time-of-day rather than undefined breaking the scheduler.
+        setSectionScheduleCountsState({
+          ...defaultSettings.sectionScheduleCounts,
+          ...(parsed.sectionScheduleCounts ?? {}),
+        });
       }
       setSettingsLoaded(true);
     }
@@ -560,10 +616,10 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (settingsLoaded) {
-      const data: StoredSettings = { viewMode, hideCompleted };
+      const data: StoredSettings = { viewMode, hideCompleted, sectionScheduleCounts };
       AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
     }
-  }, [viewMode, hideCompleted]);
+  }, [viewMode, hideCompleted, sectionScheduleCounts]);
 
   useEffect(() => {
     async function loadDaySnapshots() {
@@ -592,22 +648,65 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // (loaded from storage without that field) — this only fills in the new
   // field; orderedIds and completedAtSnapshot stay exactly as originally
   // frozen, so this isn't a re-snapshot, just closing a data-shape gap.
+  //
+  // Waits on settingsLoaded too now, since computing a fresh snapshot
+  // needs sectionScheduleCounts — without this guard, a cold-start visit
+  // to a brand-new date could freeze a snapshot built from the default
+  // counts for an instant before the user's saved counts arrive.
   useEffect(() => {
-    if (!loaded || !daySnapshotsLoaded) return;
+    if (!loaded || !daySnapshotsLoaded || !settingsLoaded) return;
 
     const existing = daySnapshots[selectedDate];
 
     if (!existing) {
-      const snapshot = computeDaySnapshot(habits, selectedDate);
+      const snapshot = computeDaySnapshot(habits, selectedDate, sectionScheduleCounts);
       setDaySnapshots(prev => ({ ...prev, [selectedDate]: snapshot }));
       return;
     }
 
     if (!existing.scheduledIds) {
-      const scheduledIds = computeScheduledIds(habits, selectedDate);
+      const scheduledIds = computeScheduledIds(habits, selectedDate, sectionScheduleCounts);
       setDaySnapshots(prev => ({ ...prev, [selectedDate]: { ...existing, scheduledIds } }));
     }
-  }, [loaded, daySnapshotsLoaded, selectedDate, habits, daySnapshots]);
+  }, [loaded, daySnapshotsLoaded, settingsLoaded, selectedDate, habits, daySnapshots, sectionScheduleCounts]);
+
+  // Recomputes scheduledIds for selectedDate against the current
+  // scheduling logic, in place — orderedIds and completedAtSnapshot are
+  // left untouched, since those are meant to stay genuinely frozen for
+  // the day. This is what "entering Auto mode" and the cold-start effect
+  // below both call, so a schedule you're looking at always reflects
+  // whatever computeScheduledIds currently does, not whatever it did the
+  // first time this date was ever visited.
+  const hasInitialAutoRescheduleRun = useRef(false);
+
+  function rescheduleSelectedDate() {
+    setDaySnapshots(prev => {
+      const existing = prev[selectedDate];
+      if (!existing) return prev; // nothing to refresh yet; the snapshot-creation effect will handle it
+      return {
+        ...prev,
+        [selectedDate]: {
+          ...existing,
+          scheduledIds: computeScheduledIds(habits, selectedDate, sectionScheduleCounts),
+        },
+      };
+    });
+  }
+
+  // Covers the case setViewMode's tap-triggered reschedule can't: the app
+  // was closed while already in Auto mode, and viewMode loads back in as
+  // 'auto' on the next launch with no button press to hang a refresh off
+  // of. Runs once, right after the first date's snapshot is guaranteed to
+  // exist — not on every render, and not every time viewMode happens to
+  // be 'auto' afterwards (explicit taps already cover that case).
+  useEffect(() => {
+    if (!loaded || !daySnapshotsLoaded || !settingsLoaded) return;
+    if (hasInitialAutoRescheduleRun.current) return;
+    hasInitialAutoRescheduleRun.current = true;
+    if (viewMode === 'auto') {
+      rescheduleSelectedDate();
+    }
+  }, [loaded, daySnapshotsLoaded, settingsLoaded]);
 
   function goToPreviousDay() {
     const d = new Date(selectedDate);
@@ -927,8 +1026,9 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
 
   // The core of both swapHabit and addOneMore: within a section, who's the
   // next most-urgent habit not already on today's schedule? Same ranking
-  // computeScheduledIds uses (urgent first, 'met' excluded), just re-run
-  // against whatever's currently scheduled rather than from scratch.
+  // computeScheduledIds uses (urgent first, status then slack then order,
+  // 'met' excluded), just re-run against whatever's currently scheduled
+  // rather than from scratch.
   function getNextCandidate(timeOfDay: TimeOfDay): Habit | null {
     const snapshot = daySnapshots[selectedDate];
     if (!snapshot) return null;
@@ -937,12 +1037,14 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
 
     const ranked = group
-      .map(h => ({ habit: h, status: calculateStatusIgnoringDate(h, selectedDate) }))
-      .filter(x => x.status !== 'met')
+      .map(h => ({ habit: h, info: calculateInfoIgnoringDate(h, selectedDate) }))
+      .filter(x => x.info.status !== 'met')
       .filter(x => !currentScheduled.includes(x.habit.id))
       .sort((a, b) => {
-        const diff = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
+        const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
         if (diff !== 0) return diff;
+        const slackDiff = a.info.slack - b.info.slack;
+        if (slackDiff !== 0) return slackDiff;
         return a.habit.order - b.habit.order;
       });
 
@@ -1005,7 +1107,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     const cursor = new Date(today);
     for (let i = 0; i < days; i++) {
       const ds = dateToString(cursor);
-      const scheduledIds = computeScheduledIds(simulatedHabits, ds);
+      const scheduledIds = computeScheduledIds(simulatedHabits, ds, sectionScheduleCounts);
 
       // Return the real (non-simulated) habit objects for display, so
       // names/categories/etc. are never accidentally sourced from the
@@ -1028,22 +1130,44 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return result;
   }
 
+  // Switching into Auto mode always refreshes selectedDate's scheduledIds
+  // against the current logic first — including re-tapping Auto while
+  // it's already selected, which doubles as a manual "reschedule" action
+  // without needing a separate button for it. This is also what keeps the
+  // Today view and the Schedule (projection) screen in agreement: the
+  // projection screen always computes fresh, so Today needs a way to
+  // catch up to it rather than trusting whatever got frozen on first
+  // visit to the date.
   function setViewMode(mode: ViewMode) {
     setViewModeState(mode);
+    if (mode === 'auto') {
+      rescheduleSelectedDate();
+    }
   }
 
   function setHideCompleted(hide: boolean) {
     setHideCompletedState(hide);
   }
 
+  // Updates one section's guide number (clamped to a minimum of 1 — a
+  // section scheduling zero habits isn't a supported state). Doesn't
+  // touch any already-frozen daySnapshot; it only changes what gets
+  // computed for dates that haven't had their first-visit snapshot taken
+  // yet, same "frozen unless explicitly overridden" rule as the rest of
+  // Auto mode.
+  function setSectionScheduleCount(timeOfDay: TimeOfDay, count: number) {
+    const clamped = Math.max(1, Math.floor(count));
+    setSectionScheduleCountsState(prev => ({ ...prev, [timeOfDay]: clamped }));
+  }
+
   // Sorts (and, in Auto mode, filters) a group of habits already narrowed
   // to one timeOfDay. Static = manual `order`. Dynamic = the frozen
   // per-day neglect ranking from daySnapshots. Auto = that same ranking,
   // but restricted to only the habits daySnapshots picked as today's
-  // schedule (see computeScheduledIds) — capped at
-  // MAX_SCHEDULED_PER_SECTION per section. All non-static modes fall back
-  // to manual `order`, unfiltered, for the brief moment before today's
-  // first snapshot has been computed.
+  // schedule (see computeScheduledIds) — capped per-section via
+  // sectionScheduleCounts. All non-static modes fall back to manual
+  // `order`, unfiltered, for the brief moment before today's first
+  // snapshot has been computed.
   function getOrderedHabits(habitsInGroup: Habit[]): Habit[] {
     if (viewMode === 'static') {
       return [...habitsInGroup].sort((a, b) => a.order - b.order);
@@ -1120,6 +1244,8 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         addOneMore,
         getNextCandidate,
         getScheduleProjection,
+        sectionScheduleCounts,
+        setSectionScheduleCount,
       }}
     >
       {children}
