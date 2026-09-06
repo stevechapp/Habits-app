@@ -6,6 +6,7 @@ export type Period = 'day' | 'week' | 'month';
 export type PeriodStatus = 'met' | 'onTrack' | 'dueSoon' | 'behind';
 export type ViewMode = 'static' | 'dynamic' | 'auto';
 export type SectionCounts = Record<TimeOfDay, number>;
+export type SectionCursors = Record<TimeOfDay, number>;
 
 export type Habit = {
   id: string;
@@ -63,6 +64,12 @@ type DaySnapshot = {
   orderedIds: string[]; // habit ids, most-neglected first, as of snapshot time
   completedAtSnapshot: string[]; // habit ids already done as of snapshot time
   scheduledIds: string[]; // habit ids Auto mode picked for this date, capped per section
+  // Per-section position in the urgency-ranked candidate list, advanced by
+  // one on every swap in that section. Picking candidate[cursor % pool.length]
+  // means repeated swapping walks forward through the list and wraps back
+  // to the top once you've been through everyone — no need to separately
+  // remember what's already been declined.
+  sectionCursors: SectionCursors;
 };
 type DaySnapshots = Record<string, DaySnapshot>; // date string -> snapshot
 
@@ -92,6 +99,7 @@ type HabitsContextType = {
   getHabitHistorySquares: (habit: Habit) => HistorySquare[];
   getPeriodStreak: (habit: Habit) => number;
   getCompletionRate: (habit: Habit) => CompletionRate;
+  getHabitAverageRate: (habit: Habit) => number | null;
   // Points / scoring
   getDayScore: (dateStr: string, categories?: string[]) => DayScore;
   getWeekScore: (categories?: string[]) => number;
@@ -131,6 +139,7 @@ const COMPARISON_LOOKBACK = 5; // how many prior completed periods the "average"
 // Adjustable per-section at runtime via setSectionScheduleCount; this is
 // just the starting point for a fresh install / before any preference is set.
 const DEFAULT_SECTION_COUNTS: SectionCounts = { morning: 3, afternoon: 3, evening: 3 };
+const DEFAULT_SECTION_CURSORS: SectionCursors = { morning: 0, afternoon: 0, evening: 0 };
 
 // Average days in a month, for the capacity-warning estimate below. Not
 // used anywhere in real scheduling — getPeriodBounds handles actual
@@ -303,6 +312,34 @@ function calculateInfoIgnoringDate(habit: Habit, dateStr: string): PeriodInfo {
   return calculatePeriodInfo(habitAsIfNotDone, dateStr);
 }
 
+// Ranks a group of habits (already narrowed to one section) by urgency —
+// 'met' excluded, then sorted behind < dueSoon < onTrack, with
+// missedStreak (descending — longer neglect first) and slack (ascending)
+// as tiebreaks, then manual order. This is the one place that ranking
+// logic lives; computeScheduledIds, getNextCandidate, and the
+// swap-cycling logic all call this rather than each keeping their own
+// copy, so there's no risk of them quietly disagreeing about what
+// "most urgent" means. Uses calculateSchedulingInfo rather than the
+// plain local calculation specifically so multi-period neglect (see
+// getMissedPeriodsStreak) factors into scheduling — this is the version
+// of "urgent" that's allowed to persist across period boundaries, unlike
+// calculatePeriodInfo/getPeriodInfo used for the visible badge and
+// squares.
+function rankCandidates(group: Habit[], dateStr: string): { habit: Habit; info: SchedulingInfo }[] {
+  return group
+    .map(h => ({ habit: h, info: calculateSchedulingInfo(h, dateStr) }))
+    .filter(x => x.info.status !== 'met')
+    .sort((a, b) => {
+      const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
+      if (diff !== 0) return diff;
+      const streakDiff = b.info.missedStreak - a.info.missedStreak;
+      if (streakDiff !== 0) return streakDiff;
+      const slackDiff = a.info.slack - b.info.slack;
+      if (slackDiff !== 0) return slackDiff;
+      return a.habit.order - b.habit.order;
+    });
+}
+
 // Picks Auto mode's schedule for a date: within each time-of-day section,
 // every not-yet-met habit is a candidate — there's no "too early to
 // bother" cutoff, because if a habit still needs progress this period,
@@ -330,17 +367,7 @@ function computeScheduledIds(habits: Habit[], dateStr: string, sectionCounts: Se
   timeOfDays.forEach(timeOfDay => {
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
 
-    const ranked = group
-      .map(h => ({ habit: h, info: calculateInfoIgnoringDate(h, dateStr) }))
-      // 'met' habits don't need scheduling — everything else is fair game.
-      .filter(x => x.info.status !== 'met')
-      .sort((a, b) => {
-        const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
-        if (diff !== 0) return diff;
-        const slackDiff = a.info.slack - b.info.slack;
-        if (slackDiff !== 0) return slackDiff;
-        return a.habit.order - b.habit.order;
-      });
+    const ranked = rankCandidates(group, dateStr);
 
     const topPicks = ranked.slice(0, sectionCounts[timeOfDay]).map(x => x.habit.id);
 
@@ -367,20 +394,36 @@ function computeScheduledIds(habits: Habit[], dateStr: string, sectionCounts: Se
 }
 
 // Computes the neglect-ranked id list for a date from current habit data.
-// Only ever called once per date — see the snapshot effect below.
-function computeDaySnapshot(habits: Habit[], dateStr: string, sectionCounts: SectionCounts): DaySnapshot {
+// The neglect-ranked id list (most-neglected first) for a date, debt-aware
+// via applyMissedPeriodsDebt on top of the REAL local status (not the
+// "ignore today's completion" version scheduling uses) so two things are
+// both true: a habit neglected for months still ranks as urgent even at
+// the start of a fresh period, AND checking a habit off today still sinks
+// it down the order immediately, same as before this debt logic existed.
+// Extracted as its own function so it can be called both when a date's
+// snapshot is first created (computeDaySnapshot) and when refreshing an
+// already-frozen one (rescheduleSelectedDate) — see that function for why
+// orderedIds needs to be refreshable at all now, not just scheduledIds.
+function computeOrderedIds(habits: Habit[], dateStr: string): string[] {
   const ranked = [...habits].sort((a, b) => {
-    const statusA = calculatePeriodInfo(a, dateStr).status;
-    const statusB = calculatePeriodInfo(b, dateStr).status;
-    const diff = STATUS_PRIORITY[statusA] - STATUS_PRIORITY[statusB];
+    const infoA = applyMissedPeriodsDebt(a, dateStr, calculatePeriodInfo(a, dateStr));
+    const infoB = applyMissedPeriodsDebt(b, dateStr, calculatePeriodInfo(b, dateStr));
+    const diff = STATUS_PRIORITY[infoA.status] - STATUS_PRIORITY[infoB.status];
     if (diff !== 0) return diff;
+    const streakDiff = infoB.missedStreak - infoA.missedStreak;
+    if (streakDiff !== 0) return streakDiff;
     return a.order - b.order; // stable tiebreak within the same status
   });
+  return ranked.map(h => h.id);
+}
 
+// Only ever called once per date — see the snapshot effect below.
+function computeDaySnapshot(habits: Habit[], dateStr: string, sectionCounts: SectionCounts): DaySnapshot {
   return {
-    orderedIds: ranked.map(h => h.id),
+    orderedIds: computeOrderedIds(habits, dateStr),
     completedAtSnapshot: habits.filter(h => h.completions[dateStr] === true).map(h => h.id),
     scheduledIds: computeScheduledIds(habits, dateStr, sectionCounts),
+    sectionCursors: { ...DEFAULT_SECTION_CURSORS },
   };
 }
 
@@ -457,6 +500,136 @@ function stepToPreviousPeriod(dateStr: string, period: Period): string {
   const prevPeriodAnchor = new Date(start);
   prevPeriodAnchor.setDate(prevPeriodAnchor.getDate() - 1);
   return dateToString(prevPeriodAnchor);
+}
+
+// A habit's creation date, derived from its id — user-added habits use
+// Date.now() as their id (see addHabit), so this is free. The seeded
+// default habits use small hand-assigned ids ('1', '2', '3') that aren't
+// real timestamps; treated as "always existed" so they're never
+// artificially flagged as carrying debt from before the app was ever run.
+function getHabitCreatedDateStr(habit: Habit): string {
+  const ms = Number(habit.id);
+  if (!Number.isFinite(ms) || ms < 1_000_000_000_000) {
+    return '1970-01-01';
+  }
+  return dateToString(new Date(ms));
+}
+
+// How many consecutive PRIOR periods (not including the one containing
+// asOfDateStr) failed to hit target, walking backward until either a
+// period was actually met or the walk reaches a period that started
+// before the habit existed. This is what lets urgency persist across
+// period boundaries instead of quietly resetting: a habit neglected for
+// 8 months carries an 8-period streak into the fresh period, rather than
+// every new period getting evaluated purely on its own, empty-so-far
+// merits.
+//
+// Deliberately a count of PERIODS, not a sum of missed completions — an
+// earlier version summed (targetCount - completed) per missed period,
+// but that scales with each habit's own target size, which makes it an
+// unfair comparison: a 5x/week habit that lapsed for 2 weeks racks up
+// more raw "shortfall" (10) than a 1x/week habit chronically neglected
+// for 8 straight weeks (8), even though the second habit has been
+// neglected four times as long. Counting periods instead of completions
+// is habit-agnostic — "8 weeks in a row" means the same thing regardless
+// of what the weekly target actually is.
+// Consecutive days immediately before asOfDateStr where a daily habit
+// wasn't done — the day-granularity equivalent of getMissedPeriodsStreak
+// for week/month habits. Daily habits were originally excluded from debt
+// tracking entirely, on the theory that "each day is its own atomic
+// unit, nothing to carry forward." That reasoning missed the actual
+// problem: without this, a daily habit skipped for months and one
+// skipped only yesterday both read as exactly the same thing (local
+// status for an undone daily habit is always 'dueSoon', never 'behind' —
+// there's no multi-day math to push it further). This is what lets a
+// long-neglected daily habit actually surface as urgent instead of
+// looking identical to a fresh one.
+function getMissedDaysStreak(habit: Habit, asOfDateStr: string): number {
+  const createdDateStr = getHabitCreatedDateStr(habit);
+  let streak = 0;
+  const cursor = new Date(asOfDateStr);
+  cursor.setDate(cursor.getDate() - 1); // start from the day before — today isn't "missed" until the day ends
+  let safety = 0;
+
+  while (safety < 1000) {
+    safety++;
+    const ds = dateToString(cursor);
+    if (ds < createdDateStr) break; // don't count days before the habit existed
+    if (habit.completions[ds] === true) break; // found a done day — the streak stops here
+    streak++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  return streak;
+}
+
+function getMissedPeriodsStreak(habit: Habit, asOfDateStr: string): number {
+  if (habit.targetPeriod === 'day') {
+    return getMissedDaysStreak(habit, asOfDateStr);
+  }
+
+  const createdDateStr = getHabitCreatedDateStr(habit);
+  let streak = 0;
+  let anchor = stepToPreviousPeriod(asOfDateStr, habit.targetPeriod);
+  let safety = 0;
+
+  while (safety < 1000) {
+    safety++;
+    const { start } = getPeriodBounds(anchor, habit.targetPeriod);
+    if (dateToString(start) < createdDateStr) break; // don't count periods before the habit existed
+    const completed = countFullPeriodCompletions(habit, anchor);
+    if (completed >= habit.targetCount) break; // this period was met — the streak stops here
+    streak++;
+    anchor = stepToPreviousPeriod(anchor, habit.targetPeriod);
+  }
+
+  return streak;
+}
+
+// PeriodInfo plus the consecutive-missed-periods streak from unresolved
+// prior periods — used only for scheduling/ranking (see rankCandidates)
+// and for Dynamic mode's neglect ordering (see computeDaySnapshot), never
+// exposed through the context, so calculatePeriodInfo/getPeriodInfo (the
+// squares, the visible status badge, momentum, points) stay exactly as
+// they were: purely local to the current period.
+type SchedulingInfo = PeriodInfo & { missedStreak: number };
+
+// Layers cumulative debt on top of an already-computed local PeriodInfo.
+// Takes `base` as a parameter rather than computing it internally because
+// there are two legitimately different "local" calculations that both
+// need debt layered on top of them: calculateInfoIgnoringDate (used for
+// scheduling — a habit shouldn't vanish from consideration just because
+// you happened to do it before opening the app) and plain
+// calculatePeriodInfo (used for Dynamic mode's ordering, where a habit
+// SHOULD visually sink down the moment you check it off today — that's
+// the entire point of "Dynamic"). Debt shouldn't care which one fed it;
+// it just answers "is there unresolved history here" on top of whatever
+// today-local status it's handed.
+//
+// Any unresolved streak of missed periods at all is enough to treat the
+// habit as at least 'behind', full stop — no threshold to tune, matching
+// "it just shouldn't reset." The streak length then only breaks ties
+// among already-'behind' habits, so 8 straight months of neglect still
+// outranks a single missed period, regardless of either habit's target
+// size (see getMissedPeriodsStreak for why period-count rather than
+// completions-count is the fair unit here).
+function applyMissedPeriodsDebt(habit: Habit, dateStr: string, base: PeriodInfo): SchedulingInfo {
+  // Already met for the current period — nothing more needed right now,
+  // regardless of history. Debt reflects periods you can no longer act
+  // on; it doesn't un-meet a period you've already handled.
+  if (base.status === 'met') return { ...base, missedStreak: 0 };
+
+  const missedStreak = getMissedPeriodsStreak(habit, dateStr);
+  if (missedStreak === 0) return { ...base, missedStreak: 0 };
+
+  return { ...base, status: 'behind', missedStreak };
+}
+
+// Scheduling's version: debt layered on top of the "as if not done today"
+// local calculation. See applyMissedPeriodsDebt for why that base
+// specifically.
+function calculateSchedulingInfo(habit: Habit, dateStr: string): SchedulingInfo {
+  return applyMissedPeriodsDebt(habit, dateStr, calculateInfoIgnoringDate(habit, dateStr));
 }
 
 // --- Points / scoring engine ---------------------------------------------
@@ -651,10 +824,11 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // shape the snapshot for a date that hasn't been taken yet (e.g.
   // tomorrow, once tomorrow arrives and gets its own first-visit snapshot).
   //
-  // Also backfills scheduledIds onto any snapshot that predates Auto mode
-  // (loaded from storage without that field) — this only fills in the new
-  // field; orderedIds and completedAtSnapshot stay exactly as originally
-  // frozen, so this isn't a re-snapshot, just closing a data-shape gap.
+  // Also backfills scheduledIds/sectionCursors onto any snapshot that
+  // predates Auto mode / swap-cycling (loaded from storage without
+  // those fields) — this only fills in the new fields; orderedIds and
+  // completedAtSnapshot stay exactly as originally frozen, so this isn't
+  // a re-snapshot, just closing a data-shape gap.
   //
   // Waits on settingsLoaded too now, since computing a fresh snapshot
   // needs sectionScheduleCounts — without this guard, a cold-start visit
@@ -671,20 +845,43 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    if (!existing.sectionCursors) {
+      setDaySnapshots(prev => ({
+        ...prev,
+        [selectedDate]: {
+          ...existing,
+          scheduledIds: existing.scheduledIds ?? computeScheduledIds(habits, selectedDate, sectionScheduleCounts),
+          sectionCursors: { ...DEFAULT_SECTION_CURSORS },
+        },
+      }));
+      return;
+    }
+
     if (!existing.scheduledIds) {
       const scheduledIds = computeScheduledIds(habits, selectedDate, sectionScheduleCounts);
       setDaySnapshots(prev => ({ ...prev, [selectedDate]: { ...existing, scheduledIds } }));
     }
   }, [loaded, daySnapshotsLoaded, settingsLoaded, selectedDate, habits, daySnapshots, sectionScheduleCounts]);
 
-  // Recomputes scheduledIds for selectedDate against the current
-  // scheduling logic, in place — orderedIds and completedAtSnapshot are
-  // left untouched, since those are meant to stay genuinely frozen for
-  // the day. This is what "entering Auto mode" and the cold-start effect
-  // below both call, so a schedule you're looking at always reflects
-  // whatever computeScheduledIds currently does, not whatever it did the
-  // first time this date was ever visited.
-  const hasInitialAutoRescheduleRun = useRef(false);
+  // Recomputes both scheduledIds AND orderedIds for selectedDate against
+  // current logic, in place — completedAtSnapshot is left untouched,
+  // since "was this done as of when the day started" is the one thing
+  // that's meant to stay genuinely frozen. orderedIds used to be frozen
+  // forever too, on the theory that only scheduledIds (Auto mode's
+  // picks) ever needed refreshing — but that left Dynamic mode's neglect
+  // ordering with no way to pick up algorithm changes at all: a snapshot
+  // taken before a fix like the missed-periods-debt logic would show the
+  // old ordering until the calendar date itself rolled over, no matter
+  // how many times you switched modes or reopened the app. Refreshing
+  // both together is what "entering Auto or Dynamic mode" and the
+  // cold-start effect below now call, so whichever mode you're looking
+  // at always reflects current logic, not whatever was true the first
+  // time this date was ever visited. Also resets sectionCursors — a
+  // fresh reschedule changes what's actually in each section, so a swap
+  // cursor left over from before wouldn't reliably point at anything
+  // meaningful; starting the cycle over is the more predictable behavior
+  // for what's meant to read as "start fresh."
+  const hasInitialModeRescheduleRun = useRef(false);
 
   function rescheduleSelectedDate() {
     setDaySnapshots(prev => {
@@ -694,23 +891,26 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         ...prev,
         [selectedDate]: {
           ...existing,
+          orderedIds: computeOrderedIds(habits, selectedDate),
           scheduledIds: computeScheduledIds(habits, selectedDate, sectionScheduleCounts),
+          sectionCursors: { ...DEFAULT_SECTION_CURSORS },
         },
       };
     });
   }
 
   // Covers the case setViewMode's tap-triggered reschedule can't: the app
-  // was closed while already in Auto mode, and viewMode loads back in as
-  // 'auto' on the next launch with no button press to hang a refresh off
-  // of. Runs once, right after the first date's snapshot is guaranteed to
-  // exist — not on every render, and not every time viewMode happens to
-  // be 'auto' afterwards (explicit taps already cover that case).
+  // was closed while already in Auto or Dynamic mode, and viewMode loads
+  // back in that way on the next launch with no button press to hang a
+  // refresh off of. Runs once, right after the first date's snapshot is
+  // guaranteed to exist — not on every render, and not every time
+  // viewMode happens to be Auto/Dynamic afterwards (explicit taps already
+  // cover that case).
   useEffect(() => {
     if (!loaded || !daySnapshotsLoaded || !settingsLoaded) return;
-    if (hasInitialAutoRescheduleRun.current) return;
-    hasInitialAutoRescheduleRun.current = true;
-    if (viewMode === 'auto') {
+    if (hasInitialModeRescheduleRun.current) return;
+    hasInitialModeRescheduleRun.current = true;
+    if (viewMode === 'auto' || viewMode === 'dynamic') {
       rescheduleSelectedDate();
     }
   }, [loaded, daySnapshotsLoaded, settingsLoaded]);
@@ -1031,54 +1231,123 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return { met, total, rate };
   }
 
-  // The core of both swapHabit and addOneMore: within a section, who's the
-  // next most-urgent habit not already on today's schedule? Same ranking
-  // computeScheduledIds uses (urgent first, status then slack then order,
-  // 'met' excluded), just re-run against whatever's currently scheduled
-  // rather than from scratch.
+  // Average actual completions per fully-elapsed period, in the same
+  // units as targetCount (e.g. a 2x/week habit averaging 2.3 actual
+  // completions/week). Deliberately anchored on the habit's *creation*
+  // date rather than its first completion — unlike getCompletionRate
+  // above, an idle stretch before you ever did the habit should drag this
+  // number down, the same way getMissedPeriodsStreak treats it as real
+  // debt rather than something to politely skip past. The current,
+  // still-in-progress period is excluded so the number doesn't jitter as
+  // the week/month plays out. Returns null when there's no fully-elapsed
+  // period yet (a habit created this period) — nothing meaningful to
+  // average, rather than a misleading 0.
+  function getHabitAverageRate(habit: Habit): number | null {
+    const createdDateStr = getHabitCreatedDateStr(habit);
+    const currentPeriodStart = getPeriodBounds(today, habit.targetPeriod).start;
+
+    let anchor = createdDateStr;
+    let totalCompletions = 0;
+    let periodCount = 0;
+    let safety = 0;
+
+    while (safety < 2000) {
+      safety++;
+      const { start, end } = getPeriodBounds(anchor, habit.targetPeriod);
+      if (start >= currentPeriodStart) break;
+
+      // Skip the partial period the habit was created inside of, if any
+      // — same boundary rule getMissedPeriodsStreak uses, so the two
+      // stay consistent. Without this, a habit created mid-week had its
+      // first (partial, unavoidably-0-completion) week counted as a real
+      // missed period, showing a misleading 0 average before it had even
+      // had one full period to actually attempt the target in.
+      if (dateToString(start) >= createdDateStr) {
+        totalCompletions += countFullPeriodCompletions(habit, anchor);
+        periodCount++;
+      }
+
+      const next = new Date(end);
+      next.setDate(next.getDate() + 1);
+      anchor = dateToString(next);
+    }
+
+    return periodCount > 0 ? totalCompletions / periodCount : null;
+  }
+
+  // Used by addOneMore: within a section, who's the single most-urgent
+  // habit not already on today's schedule? Deliberately has no memory of
+  // past swaps — "one more" is about extending the list, not cycling
+  // through declined options, so it should always offer whatever's
+  // genuinely most urgent right now.
   function getNextCandidate(timeOfDay: TimeOfDay): Habit | null {
     const snapshot = daySnapshots[selectedDate];
     if (!snapshot) return null;
 
     const currentScheduled = snapshot.scheduledIds ?? [];
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
-
-    const ranked = group
-      .map(h => ({ habit: h, info: calculateInfoIgnoringDate(h, selectedDate) }))
-      .filter(x => x.info.status !== 'met')
-      .filter(x => !currentScheduled.includes(x.habit.id))
-      .sort((a, b) => {
-        const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
-        if (diff !== 0) return diff;
-        const slackDiff = a.info.slack - b.info.slack;
-        if (slackDiff !== 0) return slackDiff;
-        return a.habit.order - b.habit.order;
-      });
+    const ranked = rankCandidates(group, selectedDate).filter(x => !currentScheduled.includes(x.habit.id));
 
     return ranked[0]?.habit ?? null;
   }
 
   // Auto mode's explicit escape hatch: replaces one scheduled habit with
-  // whatever's next in line for urgency in the same section. If nothing
-  // qualifies, the habit is simply removed — swap becomes "drop," not
-  // "replace with something arbitrary." This is the one place today's
-  // snapshot is allowed to change after being frozen — a deliberate,
-  // explicit override, not an automatic recalculation.
+  // the next one along in that section's urgency-ranked candidate pool,
+  // using a per-section rotating cursor (sectionCursors) rather than the
+  // single most-urgent pick every time. Swapping the same section
+  // repeatedly walks forward through the whole list — behind, dueSoon,
+  // onTrack, all of it — and wraps back to the top via modulo once you've
+  // seen everyone, rather than bouncing between two habits or eventually
+  // dropping down to nothing.
+  //
+  // The pool deliberately excludes only OTHER slots' current occupants,
+  // not the habit being swapped itself — that keeps the pool's
+  // composition (and therefore what each index means) stable across
+  // repeated swaps of the same slot. Excluding the swapped-out habit too
+  // would make the pool's identity shift every single swap, which can
+  // permanently strand some habits depending on the group's size (found
+  // this the hard way by simulating it before shipping) — the cursor
+  // would keep advancing but the list it's indexing into keeps changing
+  // out from under it. Instead, the habit is left in a stable pool and
+  // simply skipped over if the cursor happens to land on it.
+  //
+  // If the section has no eligible candidates at all (everything's either
+  // scheduled elsewhere or 'met'), the habit is simply removed — swap
+  // becomes "drop," not "replace with something arbitrary." This is one
+  // of the few places today's snapshot is allowed to change after being
+  // frozen — a deliberate, explicit override, not an automatic
+  // recalculation.
   function swapHabit(id: string) {
     const habit = habits.find(h => h.id === id);
     const snapshot = daySnapshots[selectedDate];
     if (!habit || !snapshot) return;
 
     const currentScheduled = snapshot.scheduledIds ?? [];
-    const replacement = getNextCandidate(habit.timeOfDay);
+    const cursors = snapshot.sectionCursors ?? DEFAULT_SECTION_CURSORS;
+    const cursor = cursors[habit.timeOfDay] ?? 0;
+
+    const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
+    const otherSlotsScheduled = currentScheduled.filter(sid => sid !== id);
+    const pool = rankCandidates(group, selectedDate).filter(x => !otherSlotsScheduled.includes(x.habit.id));
+
+    let replacement: Habit | null = null;
+    if (pool.length > 0) {
+      let index = cursor % pool.length;
+      if (pool[index].habit.id === id) {
+        index = (index + 1) % pool.length;
+      }
+      replacement = pool[index].habit.id === id ? null : pool[index].habit;
+    }
 
     const newScheduledIds = currentScheduled
       .filter(sid => sid !== id)
       .concat(replacement ? [replacement.id] : []);
 
+    const newCursors = { ...cursors, [habit.timeOfDay]: cursor + 1 };
+
     setDaySnapshots(prev => ({
       ...prev,
-      [selectedDate]: { ...snapshot, scheduledIds: newScheduledIds },
+      [selectedDate]: { ...snapshot, scheduledIds: newScheduledIds, sectionCursors: newCursors },
     }));
   }
 
@@ -1137,17 +1406,18 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return result;
   }
 
-  // Switching into Auto mode always refreshes selectedDate's scheduledIds
-  // against the current logic first — including re-tapping Auto while
-  // it's already selected, which doubles as a manual "reschedule" action
-  // without needing a separate button for it. This is also what keeps the
-  // Today view and the Schedule (projection) screen in agreement: the
-  // projection screen always computes fresh, so Today needs a way to
-  // catch up to it rather than trusting whatever got frozen on first
-  // visit to the date.
+  // Switching into Auto or Dynamic mode always refreshes selectedDate's
+  // scheduledIds/orderedIds against the current logic first — including
+  // re-tapping a mode that's already selected, which doubles as a manual
+  // "reschedule" action without needing a separate button for it. This is
+  // also what keeps the Today view and the Schedule (projection) screen
+  // in agreement: the projection screen always computes fresh, so Today
+  // needs a way to catch up to it rather than trusting whatever got
+  // frozen on first visit to the date. Static mode doesn't need this — it
+  // ignores daySnapshots entirely and sorts by manual order.
   function setViewMode(mode: ViewMode) {
     setViewModeState(mode);
-    if (mode === 'auto') {
+    if (mode === 'auto' || mode === 'dynamic') {
       rescheduleSelectedDate();
     }
   }
@@ -1254,6 +1524,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getHabitHistorySquares,
         getPeriodStreak,
         getCompletionRate,
+        getHabitAverageRate,
         getDayScore,
         getWeekScore,
         getMonthScore,

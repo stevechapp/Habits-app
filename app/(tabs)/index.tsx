@@ -62,6 +62,7 @@ export default function HomeScreen() {
     hideCompleted, setHideCompleted, shouldShowHabit,
     swapHabit, addOneMore, getNextCandidate,
     sectionScheduleCounts, setSectionScheduleCount, getSectionDemand,
+    getHabitAverageRate,
   } = useHabits();
 
   if (!loaded) return null;
@@ -195,6 +196,7 @@ export default function HomeScreen() {
               const periodInfo = getPeriodInfo(item);
               const isDaily = item.targetPeriod === 'day';
               const rowColor = doneThatDay ? '#d9f2d9' : getCategoryColor(item.category);
+              const averageRate = getHabitAverageRate(item);
 
               return (
                 // The Animated.View (not the TouchableOpacity inside it) is what
@@ -220,9 +222,21 @@ export default function HomeScreen() {
                           </View>
                         </View>
 
-                        <Text style={styles.habitMeta}>
-                          {item.targetCount}× per {item.targetPeriod}
-                        </Text>
+                        <View style={styles.metaRow}>
+                          <Text style={styles.habitMeta}>
+                            {item.targetCount}× per {item.targetPeriod}
+                          </Text>
+                          {averageRate !== null && (
+                            <Text
+                              style={[
+                                styles.averageRateText,
+                                { color: averageRate >= item.targetCount ? '#27ae60' : '#c0392b' },
+                              ]}
+                            >
+                              avg {averageRate.toFixed(1)}
+                            </Text>
+                          )}
+                        </View>
 
                         {!isDaily && (
                           <>
@@ -418,7 +432,9 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   categoryTagText: { fontSize: 11, color: '#555', fontWeight: '600' },
-  habitMeta: { fontSize: 13, color: '#888', marginTop: 2, textTransform: 'capitalize' },
+  habitMeta: { fontSize: 13, color: '#888', textTransform: 'capitalize' },
+  metaRow: { flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 2 },
+  averageRateText: { fontSize: 12, fontWeight: '700' },
   squaresRow: { flexDirection: 'row', gap: 4, marginTop: 6, flexWrap: 'wrap' },
   square: { width: 12, height: 12, borderRadius: 3 },
   squareDone: { backgroundColor: '#27ae60' },
