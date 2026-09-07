@@ -62,7 +62,7 @@ export default function HomeScreen() {
     hideCompleted, setHideCompleted, shouldShowHabit,
     swapHabit, addOneMore, getNextCandidate,
     sectionScheduleCounts, setSectionScheduleCount, getSectionDemand,
-    getHabitAverageRate,
+    getHabitAverageRate, isInCatchUp,
   } = useHabits();
 
   if (!loaded) return null;
@@ -197,6 +197,7 @@ export default function HomeScreen() {
               const isDaily = item.targetPeriod === 'day';
               const rowColor = doneThatDay ? '#d9f2d9' : getCategoryColor(item.category);
               const averageRate = getHabitAverageRate(item);
+              const inCatchUp = isInCatchUp(item);
 
               return (
                 // The Animated.View (not the TouchableOpacity inside it) is what
@@ -217,6 +218,11 @@ export default function HomeScreen() {
                       <View style={{ flex: 1 }}>
                         <View style={styles.titleRow}>
                           <Text style={styles.habitText}>{item.name}</Text>
+                          {inCatchUp && (
+                            <View style={styles.catchUpTag}>
+                              <Text style={styles.catchUpTagText}>🔄 Catching up</Text>
+                            </View>
+                          )}
                           <View style={styles.categoryTag}>
                             <Text style={styles.categoryTagText}>{item.category}</Text>
                           </View>
@@ -432,6 +438,13 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   categoryTagText: { fontSize: 11, color: '#555', fontWeight: '600' },
+  catchUpTag: {
+    backgroundColor: '#FEF3C7',
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  catchUpTagText: { fontSize: 11, color: '#92400E', fontWeight: '700' },
   habitMeta: { fontSize: 13, color: '#888', textTransform: 'capitalize' },
   metaRow: { flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 2 },
   averageRateText: { fontSize: 12, fontWeight: '700' },

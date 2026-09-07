@@ -100,6 +100,11 @@ type HabitsContextType = {
   getPeriodStreak: (habit: Habit) => number;
   getCompletionRate: (habit: Habit) => CompletionRate;
   getHabitAverageRate: (habit: Habit) => number | null;
+  // Catch-up mode: true when a habit's average completion rate (since
+  // creation, excluding the in-progress period) has fallen below target.
+  // Purely a scheduling-priority signal — see the SchedulingInfo comment
+  // for why this doesn't need to touch streaks/scoring/debt at all.
+  isInCatchUp: (habit: Habit) => boolean;
   // Points / scoring
   getDayScore: (dateStr: string, categories?: string[]) => DayScore;
   getWeekScore: (categories?: string[]) => number;
@@ -325,19 +330,45 @@ function calculateInfoIgnoringDate(habit: Habit, dateStr: string): PeriodInfo {
 // of "urgent" that's allowed to persist across period boundaries, unlike
 // calculatePeriodInfo/getPeriodInfo used for the visible badge and
 // squares.
+function compareCandidatesByUrgency(
+  a: { habit: Habit; info: SchedulingInfo },
+  b: { habit: Habit; info: SchedulingInfo }
+): number {
+  // Catch-up habits are prioritized ahead of everyone else, full stop —
+  // even ahead of a normal 'behind' habit that isn't in catch-up. Within
+  // the catch-up group (and separately within the non-catch-up group),
+  // the usual status/streak/slack ordering still applies below.
+  const catchUpDiff = (a.info.inCatchUp ? 0 : 1) - (b.info.inCatchUp ? 0 : 1);
+  if (catchUpDiff !== 0) return catchUpDiff;
+  const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
+  if (diff !== 0) return diff;
+  const streakDiff = b.info.missedStreak - a.info.missedStreak;
+  if (streakDiff !== 0) return streakDiff;
+  const slackDiff = a.info.slack - b.info.slack;
+  if (slackDiff !== 0) return slackDiff;
+  return a.habit.order - b.habit.order;
+}
+
+// Swap's version of the ranking: the same urgency order as rankCandidates,
+// but WITHOUT excluding 'met' habits — just sorted to the back, behind
+// everything that still needs attention. Auto mode's automatic scheduling
+// (computeScheduledIds) and "+ One more?" (getNextCandidate) both use
+// rankCandidates deliberately, since surfacing an already-met habit
+// unprompted isn't useful. Swap is different: it's an explicit "show me
+// something else in this section" request, and if every other habit
+// happens to already be met, that should still give you something to
+// cycle through rather than silently doing nothing — see swapHabit.
+function rankAllForSwap(group: Habit[], dateStr: string): { habit: Habit; info: SchedulingInfo }[] {
+  return group
+    .map(h => ({ habit: h, info: calculateSchedulingInfo(h, dateStr) }))
+    .sort(compareCandidatesByUrgency);
+}
+
 function rankCandidates(group: Habit[], dateStr: string): { habit: Habit; info: SchedulingInfo }[] {
   return group
     .map(h => ({ habit: h, info: calculateSchedulingInfo(h, dateStr) }))
     .filter(x => x.info.status !== 'met')
-    .sort((a, b) => {
-      const diff = STATUS_PRIORITY[a.info.status] - STATUS_PRIORITY[b.info.status];
-      if (diff !== 0) return diff;
-      const streakDiff = b.info.missedStreak - a.info.missedStreak;
-      if (streakDiff !== 0) return streakDiff;
-      const slackDiff = a.info.slack - b.info.slack;
-      if (slackDiff !== 0) return slackDiff;
-      return a.habit.order - b.habit.order;
-    });
+    .sort(compareCandidatesByUrgency);
 }
 
 // Picks Auto mode's schedule for a date: within each time-of-day section,
@@ -416,6 +447,11 @@ function computeOrderedIds(habits: Habit[], dateStr: string): string[] {
   const ranked = [...habits].sort((a, b) => {
     const infoA = applyMissedPeriodsDebt(a, dateStr, calculatePeriodInfo(a, dateStr));
     const infoB = applyMissedPeriodsDebt(b, dateStr, calculatePeriodInfo(b, dateStr));
+    // Same catch-up-first rule as compareCandidatesByUrgency (Auto mode) —
+    // Dynamic mode's neglect ordering should agree with it rather than
+    // only surfacing catch-up habits once Auto mode is switched to.
+    const catchUpDiff = (isInCatchUp(a, dateStr) ? 0 : 1) - (isInCatchUp(b, dateStr) ? 0 : 1);
+    if (catchUpDiff !== 0) return catchUpDiff;
     const diff = STATUS_PRIORITY[infoA.status] - STATUS_PRIORITY[infoB.status];
     if (diff !== 0) return diff;
     const streakDiff = infoB.missedStreak - infoA.missedStreak;
@@ -594,13 +630,111 @@ function getMissedPeriodsStreak(habit: Habit, asOfDateStr: string): number {
   return streak;
 }
 
+// The date to start averaging from for calculateHabitAverageRate. For a
+// habit with a real timestamp id, this is just its creation date — same
+// as getHabitCreatedDateStr, unchanged from before. For a legacy/seeded
+// habit (hand-assigned id like '1'/'2'/'3', not a real Date.now() value),
+// getHabitCreatedDateStr's "treat as 1970, always existed" sentinel is
+// the RIGHT call for debt (getMissedPeriodsStreak walks BACKWARD from
+// today and simply stops at the first met period, so decades of phantom
+// pre-app history never actually get counted) but the WRONG call here:
+// this calculation walks FORWARD from the anchor, accumulating a real
+// period count as it goes — anchored at 1970, it burns its entire safety
+// budget on ~2000 nonexistent pre-app weeks and never reaches any real
+// completions at all, permanently reporting an average of 0 regardless
+// of actual history (found via a habit that was being met consistently
+// but still showed a red 0.0 average). Falls back to the earliest real
+// completion instead — same fallback getCompletionRate already uses —
+// so the average reflects actual tracked history. Returns null (no
+// baseline to average from) for a legacy habit with zero completions
+// ever, rather than fabricating a start date.
+function getAverageRateAnchorDateStr(habit: Habit): string | null {
+  const createdMs = Number(habit.id);
+  if (Number.isFinite(createdMs) && createdMs >= 1_000_000_000_000) {
+    return getHabitCreatedDateStr(habit);
+  }
+  const doneDates = Object.keys(habit.completions).filter(d => habit.completions[d] === true).sort();
+  return doneDates.length > 0 ? doneDates[0] : null;
+}
+
+// Average actual completions per fully-elapsed period, in the same units
+// as targetCount (e.g. a 2x/week habit averaging 2.3 actual
+// completions/week), as of asOfDateStr. Extracted as a pure function
+// (rather than living only on the context, closed over `today`) because
+// scheduling needs to evaluate this for arbitrary dates — a snapshot
+// date, a projected future date — not just today. The context's
+// getHabitAverageRate below is now a thin today-anchored wrapper, same
+// pattern as getPeriodInfo wrapping calculatePeriodInfo.
+//
+// Anchored on getAverageRateAnchorDateStr (see above for why that's not
+// simply getHabitCreatedDateStr) rather than first completion the way
+// getCompletionRate is — for a real-timestamp habit, an idle stretch
+// before you ever did it should drag this number down, the same way
+// getMissedPeriodsStreak treats it as real debt. The current,
+// still-in-progress period is excluded so the number doesn't jitter mid-
+// period. Returns null when there's no fully-elapsed period yet or no
+// usable anchor at all, rather than a misleading 0.
+function calculateHabitAverageRate(habit: Habit, asOfDateStr: string): number | null {
+  const anchorDateStr = getAverageRateAnchorDateStr(habit);
+  if (anchorDateStr === null) return null;
+  const currentPeriodStart = getPeriodBounds(asOfDateStr, habit.targetPeriod).start;
+
+  let anchor = anchorDateStr;
+  let totalCompletions = 0;
+  let periodCount = 0;
+  let safety = 0;
+
+  while (safety < 2000) {
+    safety++;
+    const { start, end } = getPeriodBounds(anchor, habit.targetPeriod);
+    if (start >= currentPeriodStart) break;
+
+    // Skip the partial period the anchor falls inside of, if any — same
+    // boundary rule getMissedPeriodsStreak uses relative to its own anchor.
+    if (dateToString(start) >= anchorDateStr) {
+      totalCompletions += countFullPeriodCompletions(habit, anchor);
+      periodCount++;
+    }
+
+    const next = new Date(end);
+    next.setDate(next.getDate() + 1);
+    anchor = dateToString(next);
+  }
+
+  return periodCount > 0 ? totalCompletions / periodCount : null;
+}
+
+// Catch-up mode: true once a habit's average (since creation) has fallen
+// below target. Automatic and live — nothing stored, nothing to reset on
+// a target edit, since it's recomputed fresh from calculateHabitAverageRate
+// every time. Stops being true the moment enough surplus completions have
+// pulled the average back up; see the SchedulingInfo comment for why this
+// alone (no extra bookkeeping) is also sufficient to make catch-up
+// recovery show up correctly in streaks/scoring.
+function isInCatchUp(habit: Habit, dateStr: string): boolean {
+  const avg = calculateHabitAverageRate(habit, dateStr);
+  return avg !== null && avg < habit.targetCount;
+}
+
 // PeriodInfo plus the consecutive-missed-periods streak from unresolved
 // prior periods — used only for scheduling/ranking (see rankCandidates)
 // and for Dynamic mode's neglect ordering (see computeDaySnapshot), never
 // exposed through the context, so calculatePeriodInfo/getPeriodInfo (the
 // squares, the visible status badge, momentum, points) stay exactly as
 // they were: purely local to the current period.
-type SchedulingInfo = PeriodInfo & { missedStreak: number };
+// inCatchUp is a second, independent urgency signal alongside missedStreak
+// debt: missedStreak tracks the CURRENT unbroken run of missed periods
+// (it resets the moment any single period is met), while inCatchUp tracks
+// the long-run average since creation, which can stay depressed by an old
+// gap even after the current streak has been repaired. A habit can be
+// missedStreak === 0 (last period met) and still inCatchUp === true.
+// Deliberately doesn't feed into streaks/scoring/getMissedPeriodsStreak —
+// verified (see project notes) that the period where the average crosses
+// back over target is mathematically always a period that's already
+// locally 'met', so those systems already handle catch-up recovery
+// correctly with no changes.
+type DebtInfo = PeriodInfo & { missedStreak: number };
+type SchedulingInfo = DebtInfo & { inCatchUp: boolean };
 
 // Layers cumulative debt on top of an already-computed local PeriodInfo.
 // Takes `base` as a parameter rather than computing it internally because
@@ -621,7 +755,7 @@ type SchedulingInfo = PeriodInfo & { missedStreak: number };
 // outranks a single missed period, regardless of either habit's target
 // size (see getMissedPeriodsStreak for why period-count rather than
 // completions-count is the fair unit here).
-function applyMissedPeriodsDebt(habit: Habit, dateStr: string, base: PeriodInfo): SchedulingInfo {
+function applyMissedPeriodsDebt(habit: Habit, dateStr: string, base: PeriodInfo): DebtInfo {
   // Already met for the current period — nothing more needed right now,
   // regardless of history. Debt reflects periods you can no longer act
   // on; it doesn't un-meet a period you've already handled.
@@ -637,7 +771,8 @@ function applyMissedPeriodsDebt(habit: Habit, dateStr: string, base: PeriodInfo)
 // local calculation. See applyMissedPeriodsDebt for why that base
 // specifically.
 function calculateSchedulingInfo(habit: Habit, dateStr: string): SchedulingInfo {
-  return applyMissedPeriodsDebt(habit, dateStr, calculateInfoIgnoringDate(habit, dateStr));
+  const withDebt = applyMissedPeriodsDebt(habit, dateStr, calculateInfoIgnoringDate(habit, dateStr));
+  return { ...withDebt, inCatchUp: isInCatchUp(habit, dateStr) };
 }
 
 // --- Points / scoring engine ---------------------------------------------
@@ -1239,48 +1374,16 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return { met, total, rate };
   }
 
-  // Average actual completions per fully-elapsed period, in the same
-  // units as targetCount (e.g. a 2x/week habit averaging 2.3 actual
-  // completions/week). Deliberately anchored on the habit's *creation*
-  // date rather than its first completion — unlike getCompletionRate
-  // above, an idle stretch before you ever did the habit should drag this
-  // number down, the same way getMissedPeriodsStreak treats it as real
-  // debt rather than something to politely skip past. The current,
-  // still-in-progress period is excluded so the number doesn't jitter as
-  // the week/month plays out. Returns null when there's no fully-elapsed
-  // period yet (a habit created this period) — nothing meaningful to
-  // average, rather than a misleading 0.
+  // Thin today-anchored wrapper — see the standalone calculateHabitAverageRate
+  // above for the actual logic (extracted so scheduling can evaluate this
+  // for arbitrary dates, not just today).
   function getHabitAverageRate(habit: Habit): number | null {
-    const createdDateStr = getHabitCreatedDateStr(habit);
-    const currentPeriodStart = getPeriodBounds(today, habit.targetPeriod).start;
+    return calculateHabitAverageRate(habit, today);
+  }
 
-    let anchor = createdDateStr;
-    let totalCompletions = 0;
-    let periodCount = 0;
-    let safety = 0;
-
-    while (safety < 2000) {
-      safety++;
-      const { start, end } = getPeriodBounds(anchor, habit.targetPeriod);
-      if (start >= currentPeriodStart) break;
-
-      // Skip the partial period the habit was created inside of, if any
-      // — same boundary rule getMissedPeriodsStreak uses, so the two
-      // stay consistent. Without this, a habit created mid-week had its
-      // first (partial, unavoidably-0-completion) week counted as a real
-      // missed period, showing a misleading 0 average before it had even
-      // had one full period to actually attempt the target in.
-      if (dateToString(start) >= createdDateStr) {
-        totalCompletions += countFullPeriodCompletions(habit, anchor);
-        periodCount++;
-      }
-
-      const next = new Date(end);
-      next.setDate(next.getDate() + 1);
-      anchor = dateToString(next);
-    }
-
-    return periodCount > 0 ? totalCompletions / periodCount : null;
+  // Today-anchored wrapper around isInCatchUp, for the Today-screen badge.
+  function isInCatchUpToday(habit: Habit): boolean {
+    return isInCatchUp(habit, today);
   }
 
   // Used by addOneMore: within a section, who's the single most-urgent
@@ -1299,7 +1402,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     return ranked[0]?.habit ?? null;
   }
 
-  // Auto mode's explicit escape hatch: replaces one scheduled habit with
+    // Auto mode's explicit escape hatch: replaces one scheduled habit with
   // the next one along in that section's urgency-ranked candidate pool,
   // using a per-section rotating cursor (sectionCursors) rather than the
   // single most-urgent pick every time. Swapping the same section
@@ -1319,11 +1422,16 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // out from under it. Instead, the habit is left in a stable pool and
   // simply skipped over if the cursor happens to land on it.
   //
-  // If the section has no eligible candidates at all (everything's either
-  // scheduled elsewhere or 'met'), the habit is simply removed — swap
-  // becomes "drop," not "replace with something arbitrary." This is one
-  // of the few places today's snapshot is allowed to change after being
-  // frozen — a deliberate, explicit override, not an automatic
+  // If the section has no OTHER eligible candidate right now — everything
+  // else is either scheduled elsewhere or 'met' — the swap is a no-op:
+  // there's nothing to replace this habit with, so it stays put rather
+  // than vanishing for lack of an alternative. The habit only actually
+  // gets dropped if it itself has fallen out of the eligible pool
+  // entirely (e.g. already met for reasons unrelated to today) with
+  // nothing else to take its place — "swap becomes drop" only applies
+  // when there's truly nothing left, not just nothing *else*. This is
+  // one of the few places today's snapshot is allowed to change after
+  // being frozen — a deliberate, explicit override, not an automatic
   // recalculation.
   function swapHabit(id: string) {
     const habit = habits.find(h => h.id === id);
@@ -1337,6 +1445,20 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
     const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
     const otherSlotsScheduled = currentScheduled.filter(sid => sid !== id);
     const pool = rankCandidates(group, selectedDate).filter(x => !otherSlotsScheduled.includes(x.habit.id));
+
+    // The pool deliberately includes the habit being swapped itself (see
+    // the comment above), so "nothing else eligible in this section" and
+    // "the habit itself is no longer eligible" look different here: the
+    // former is pool === [this habit, nothing else], the latter is pool
+    // not containing this habit at all (filtered out for being 'met').
+    // Only the second case should actually drop the habit — the first
+    // means there's genuinely no replacement available right now, which
+    // should leave the schedule untouched rather than removing the one
+    // thing that was still eligible just because nothing else was.
+    const hasAlternative = pool.some(x => x.habit.id !== id);
+    if (pool.length > 0 && !hasAlternative) {
+      return;
+    }
 
     let replacement: Habit | null = null;
     if (pool.length > 0) {
@@ -1533,6 +1655,7 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
         getPeriodStreak,
         getCompletionRate,
         getHabitAverageRate,
+        isInCatchUp: isInCatchUpToday,
         getDayScore,
         getWeekScore,
         getMonthScore,
