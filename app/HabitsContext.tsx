@@ -346,46 +346,54 @@ function rankCandidates(group: Habit[], dateStr: string): { habit: Habit; info: 
 // today is as valid a day for it as any other. Candidates are ranked by
 // urgency (behind, then dueSoon, then onTrack), with slack (ascending) as
 // a tiebreak within a status tier so the closest-to-due habit wins a
-// section's limited slots, and each section is filled up to its own
-// guide number (sectionCounts). Previously this filtered out onTrack
-// habits with more than a day of slack, which was meant to stop
-// low-frequency habits getting scheduled repeatedly — but for someone
-// with few/no daily habits, that filter could empty a whole section (or
-// the whole day) even though there was still real progress to make.
+// section's limited slots.
+//
+// Anything already completed on dateStr always stays visible (checking a
+// habit off is never what causes it to drop out of view) — but it now
+// counts AGAINST the section's guide number rather than sitting on top of
+// it: a section fills to sectionCounts[timeOfDay] by treating each
+// completed-and-eligible habit as an occupied slot, then tops up whatever's
+// left with the next most-urgent not-yet-done candidates. Do 3 habits in
+// Static/Dynamic mode, then switch to Auto, and — as long as those 3 were
+// eligible candidates — the section shows exactly those 3, done, with
+// nothing extra pulled in to "fill up to 3" a second time. (Previously,
+// completed habits were appended on top of the ranked top-N regardless of
+// overlap, which is what let a section balloon past its guide number even
+// when the person had already done plenty for it that day.)
+//
+// If someone completes MORE than sectionCounts[timeOfDay] eligible habits
+// in a section, all of them still show (checked) — the guide number caps
+// how many get auto-suggested, not how many can be done.
+//
 // NOTE: this always-fill-to-N approach makes the known "same low-frequency
 // habit on consecutive simulated days" issue more visible, not less —
 // that's being tracked as a separate follow-up (minimum-gap enforcement),
 // not fixed here.
-//
-// Separately, anything already completed on dateStr is always kept in the
-// result on top of the ranked picks (see completedTodayIds below) — so
-// checking a habit off is never what causes it to drop out of view.
 function computeScheduledIds(habits: Habit[], dateStr: string, sectionCounts: SectionCounts): string[] {
   const timeOfDays: TimeOfDay[] = ['morning', 'afternoon', 'evening'];
   const scheduled: string[] = [];
 
   timeOfDays.forEach(timeOfDay => {
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
-
     const ranked = rankCandidates(group, dateStr);
 
-    const topPicks = ranked.slice(0, sectionCounts[timeOfDay]).map(x => x.habit.id);
+    const doneToday = ranked.filter(x => x.habit.completions[dateStr] === true);
+    const notDoneToday = ranked.filter(x => x.habit.completions[dateStr] !== true);
+    const openSlots = Math.max(0, sectionCounts[timeOfDay] - doneToday.length);
 
-    // Anything already completed on dateStr stays visible regardless of
-    // the ranking above — being marked done is never a reason for a habit
-    // to disappear from the day you did it, even if it's technically
-    // 'met' for its period now, or if more urgent habits filled the
-    // section's usual slots. This can push a section past sectionCounts
-    // for that one day; that's intentional, since the alternative is a
-    // completed habit vanishing out from under you.
-    const completedTodayIds = group
-      .filter(h => h.completions[dateStr] === true)
-      .map(h => h.id);
+    const sectionIds = new Set<string>();
+    doneToday.forEach(x => sectionIds.add(x.habit.id));
+    notDoneToday.slice(0, openSlots).forEach(x => sectionIds.add(x.habit.id));
 
-    const sectionIds = [...topPicks];
-    completedTodayIds.forEach(id => {
-      if (!sectionIds.includes(id)) sectionIds.push(id);
-    });
+    // A habit completed today that isn't part of the ranked/eligible pool
+    // at all (e.g. already 'met' this period for reasons unrelated to
+    // today) still stays visible — rare in practice, since rankCandidates
+    // uses the ignoring-today status specifically so a same-day completion
+    // doesn't disqualify a habit, but this is the fallback for the
+    // remaining edge cases (already met earlier this period, etc.).
+    group
+      .filter(h => h.completions[dateStr] === true && !sectionIds.has(h.id))
+      .forEach(h => sectionIds.add(h.id));
 
     sectionIds.forEach(id => scheduled.push(id));
   });
