@@ -408,23 +408,18 @@ function computeScheduledIds(habits: Habit[], dateStr: string, sectionCounts: Se
     const group = habits.filter(h => h.timeOfDay === timeOfDay);
     const ranked = rankCandidates(group, dateStr);
 
-    const doneToday = ranked.filter(x => x.habit.completions[dateStr] === true);
-    const notDoneToday = ranked.filter(x => x.habit.completions[dateStr] !== true);
+    // Anything done today occupies a slot, whether or not it's still in
+    // the ranked/eligible pool — a habit that was already met before
+    // today and got checked off anyway still counts against the guide
+    // number, it just doesn't need scheduling help.
+    const doneToday = group.filter(h => h.completions[dateStr] === true);
+    const doneTodayIds = new Set(doneToday.map(h => h.id));
+    const notDoneToday = ranked.filter(x => !doneTodayIds.has(x.habit.id));
     const openSlots = Math.max(0, sectionCounts[timeOfDay] - doneToday.length);
 
     const sectionIds = new Set<string>();
-    doneToday.forEach(x => sectionIds.add(x.habit.id));
+    doneToday.forEach(h => sectionIds.add(h.id));
     notDoneToday.slice(0, openSlots).forEach(x => sectionIds.add(x.habit.id));
-
-    // A habit completed today that isn't part of the ranked/eligible pool
-    // at all (e.g. already 'met' this period for reasons unrelated to
-    // today) still stays visible — rare in practice, since rankCandidates
-    // uses the ignoring-today status specifically so a same-day completion
-    // doesn't disqualify a habit, but this is the fallback for the
-    // remaining edge cases (already met earlier this period, etc.).
-    group
-      .filter(h => h.completions[dateStr] === true && !sectionIds.has(h.id))
-      .forEach(h => sectionIds.add(h.id));
 
     sectionIds.forEach(id => scheduled.push(id));
   });
@@ -1433,53 +1428,56 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   // one of the few places today's snapshot is allowed to change after
   // being frozen — a deliberate, explicit override, not an automatic
   // recalculation.
-  function swapHabit(id: string) {
-    const habit = habits.find(h => h.id === id);
-    const snapshot = daySnapshots[selectedDate];
-    if (!habit || !snapshot) return;
+function swapHabit(id: string) {
+  const habit = habits.find(h => h.id === id);
+  const snapshot = daySnapshots[selectedDate];
+  if (!habit || !snapshot) return;
 
-    const currentScheduled = snapshot.scheduledIds ?? [];
-    const cursors = snapshot.sectionCursors ?? DEFAULT_SECTION_CURSORS;
-    const cursor = cursors[habit.timeOfDay] ?? 0;
+  const currentScheduled = snapshot.scheduledIds ?? [];
+  const cursors = snapshot.sectionCursors ?? DEFAULT_SECTION_CURSORS;
+  const cursor = cursors[habit.timeOfDay] ?? 0;
 
-    const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
-    const otherSlotsScheduled = currentScheduled.filter(sid => sid !== id);
-    const pool = rankCandidates(group, selectedDate).filter(x => !otherSlotsScheduled.includes(x.habit.id));
+  const group = habits.filter(h => h.timeOfDay === habit.timeOfDay);
+  // rankAllForSwap, not rankCandidates — swap is an explicit "show me
+  // something else" request, so it should reach every habit in the
+  // section (already-met ones sorted to the back, not excluded).
+  // Excluding them shrinks the pool to just the still-due habits, which
+  // is what caused the "stuck cycling through only 3" symptom even
+  // after the cursor coupling was fixed.
+  const ranked = rankAllForSwap(group, selectedDate);
+  if (ranked.length === 0) return;
 
-    // The pool deliberately includes the habit being swapped itself (see
-    // the comment above), so "nothing else eligible in this section" and
-    // "the habit itself is no longer eligible" look different here: the
-    // former is pool === [this habit, nothing else], the latter is pool
-    // not containing this habit at all (filtered out for being 'met').
-    // Only the second case should actually drop the habit — the first
-    // means there's genuinely no replacement available right now, which
-    // should leave the schedule untouched rather than removing the one
-    // thing that was still eligible just because nothing else was.
-    const hasAlternative = pool.some(x => x.habit.id !== id);
-    if (pool.length > 0 && !hasAlternative) {
-      return;
+  const otherSlotsScheduled = new Set(currentScheduled.filter(sid => sid !== id));
+
+  let replacement: Habit | null = null;
+  let index = cursor % ranked.length;
+  for (let steps = 0; steps < ranked.length; steps++) {
+    const candidate = ranked[index].habit;
+    if (candidate.id !== id && !otherSlotsScheduled.has(candidate.id)) {
+      replacement = candidate;
+      break;
     }
-
-    let replacement: Habit | null = null;
-    if (pool.length > 0) {
-      let index = cursor % pool.length;
-      if (pool[index].habit.id === id) {
-        index = (index + 1) % pool.length;
-      }
-      replacement = pool[index].habit.id === id ? null : pool[index].habit;
-    }
-
-    const newScheduledIds = currentScheduled
-      .filter(sid => sid !== id)
-      .concat(replacement ? [replacement.id] : []);
-
-    const newCursors = { ...cursors, [habit.timeOfDay]: cursor + 1 };
-
-    setDaySnapshots(prev => ({
-      ...prev,
-      [selectedDate]: { ...snapshot, scheduledIds: newScheduledIds, sectionCursors: newCursors },
-    }));
+    index = (index + 1) % ranked.length;
   }
+
+  // With the full list in play, "no replacement found" only happens
+  // when there's genuinely nothing else in the section to offer — treat
+  // that as a no-op rather than dropping the habit.
+  if (!replacement) return;
+
+  const newScheduledIds = currentScheduled
+    .filter(sid => sid !== id)
+    .concat([replacement.id]);
+
+  setDaySnapshots(prev => ({
+    ...prev,
+    [selectedDate]: {
+      ...snapshot,
+      scheduledIds: newScheduledIds,
+      sectionCursors: { ...cursors, [habit.timeOfDay]: index + 1 },
+    },
+  }));
+}
 
   // The other explicit escape hatch: adds one more habit to a section on
   // top of the usual cap, once everything already scheduled there is done.
